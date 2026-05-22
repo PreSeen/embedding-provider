@@ -123,7 +123,7 @@ class EmbedderRuntimeIdleOffloadTests(unittest.TestCase):
             "EMBEDDING_TASK": "text-matching",
             "DEFAULT_DIMENSIONS": "4",
             "MAX_LENGTH": "256",
-            "MAX_BATCH_SIZE": "8",
+            "MAX_BATCH_SIZE": "64",
             "BATCH_WINDOW_MS": "200",
             "IDLE_OFFLOAD_SECONDS": "1",
             "IDLE_OFFLOAD_POLL_SECONDS": "1",
@@ -158,11 +158,16 @@ class EmbedderRuntimeIdleOffloadTests(unittest.TestCase):
             self.assertEqual(runtime.runtime_status()["loaded_device"], "cuda")
             self.assertEqual(runtime.runtime_status()["engine_state"], "hot")
 
+            runtime.adaptive_batch.record_dispatch(text_count=8, vram_cap=64)
+            runtime.adaptive_batch.record_dispatch(text_count=16, vram_cap=64)
+            self.assertEqual(runtime.runtime_status()["adaptive_batch"]["current_target"], 24)
+
             runtime._last_encode_finished_at -= 2
             offloaded = runtime.maybe_offload_idle()
             self.assertTrue(offloaded)
             self.assertEqual(runtime.runtime_status()["loaded_device"], "none")
             self.assertEqual(runtime.runtime_status()["engine_state"], "offloaded")
+            self.assertEqual(runtime.runtime_status()["adaptive_batch"]["current_target"], 8)
 
             embeddings = runtime.encode(["hello world"])
             self.assertEqual(len(embeddings), 1)

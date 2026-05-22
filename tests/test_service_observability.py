@@ -73,7 +73,7 @@ if "transformers" not in sys.modules:
     fake_transformers.AutoModel = _FakeAutoModel
     sys.modules["transformers"] = fake_transformers
 
-from provider.app import create_app
+from provider.app import AdaptiveBatchState, create_app
 from provider.config import Settings
 
 
@@ -215,3 +215,71 @@ def test_embeddings_failure_updates_error_stats_and_preserves_request_id() -> No
         assert stats["requests_failed"] == 1
         assert stats["last_error_request_id"] == "embed-req-fail"
         assert "ValueError" in str(stats["last_error_summary"])
+
+
+def test_adaptive_batch_state_grows_in_eight_text_steps_when_target_is_filled() -> None:
+    state = AdaptiveBatchState(configured_max_batch_size=64)
+
+    assert state.current_target == 8
+
+    state.record_dispatch(text_count=8, vram_cap=64)
+    assert state.current_target == 16
+
+    state.record_dispatch(text_count=16, vram_cap=64)
+    assert state.current_target == 24
+
+    for target in (24, 32, 40, 48, 56, 64):
+        state.record_dispatch(text_count=target, vram_cap=64)
+
+    assert state.current_target == 64
+    assert state.snapshot()["adjustments_total"] == 7
+
+
+def test_adaptive_batch_state_shrinks_after_repeated_underfilled_dispatches() -> None:
+    state = AdaptiveBatchState(configured_max_batch_size=64)
+    state.record_dispatch(text_count=8, vram_cap=64)
+    state.record_dispatch(text_count=16, vram_cap=64)
+
+    assert state.current_target == 24
+
+    state.record_dispatch(text_count=6, vram_cap=64)
+    state.record_dispatch(text_count=5, vram_cap=64)
+    assert state.current_target == 24
+
+    state.record_dispatch(text_count=4, vram_cap=64)
+    assert state.current_target == 16
+
+    state.record_dispatch(text_count=1, vram_cap=64)
+    state.record_dispatch(text_count=1, vram_cap=64)
+    state.record_dispatch(text_count=1, vram_cap=64)
+    assert state.current_target == 8
+
+
+def test_adaptive_batch_state_respects_configured_and_vram_caps() -> None:
+    state = AdaptiveBatchState(configured_max_batch_size=64)
+
+    state.record_dispatch(text_count=8, vram_cap=8)
+    assert state.current_target == 8
+
+    state.record_dispatch(text_count=8, vram_cap=64)
+    assert state.current_target == 16
+
+    capped = AdaptiveBatchState(configured_max_batch_size=20)
+    capped.record_dispatch(text_count=8, vram_cap=64)
+    capped.record_dispatch(text_count=16, vram_cap=64)
+
+    assert capped.current_target == 20
+    assert capped.snapshot()["hard_cap"] == 20
+
+
+def test_adaptive_batch_state_reset_returns_to_initial_target() -> None:
+    state = AdaptiveBatchState(configured_max_batch_size=64)
+    state.record_dispatch(text_count=8, vram_cap=64)
+    state.record_dispatch(text_count=16, vram_cap=64)
+
+    assert state.current_target == 24
+
+    state.reset()
+
+    assert state.current_target == 8
+    assert state.snapshot()["underfilled_batches"] == 0

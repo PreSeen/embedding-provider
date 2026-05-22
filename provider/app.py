@@ -183,6 +183,101 @@ class ProviderRuntimeStats:
             }
 
 
+class AdaptiveBatchState:
+    _STEP = 8
+    _DEFAULT_MIN_TARGET = 8
+    _DEFAULT_MAX_TARGET = 64
+    _UNDERFILLED_SHRINK_THRESHOLD = 3
+
+    def __init__(self, configured_max_batch_size: int | None) -> None:
+        configured_cap = configured_max_batch_size or self._DEFAULT_MAX_TARGET
+        self._hard_cap = max(1, min(int(configured_cap), self._DEFAULT_MAX_TARGET))
+        self._min_target = min(self._DEFAULT_MIN_TARGET, self._hard_cap)
+        self._initial_target = self._min_target
+        self._current_target = self._initial_target
+        self._last_batch_texts = 0
+        self._last_vram_cap: int | None = None
+        self._saturated_batches = 0
+        self._underfilled_batches = 0
+        self._adjustments_total = 0
+        self._lock = threading.Lock()
+
+    @property
+    def current_target(self) -> int:
+        with self._lock:
+            return self._current_target
+
+    def effective_target(self, *, vram_cap: int | None = None) -> int:
+        with self._lock:
+            return self._effective_target_locked(vram_cap=vram_cap)
+
+    def reset(self) -> None:
+        with self._lock:
+            self._current_target = self._initial_target
+            self._last_batch_texts = 0
+            self._last_vram_cap = None
+            self._saturated_batches = 0
+            self._underfilled_batches = 0
+            self._adjustments_total += 1
+
+    def record_dispatch(self, *, text_count: int, vram_cap: int | None) -> None:
+        with self._lock:
+            self._last_batch_texts = max(0, int(text_count))
+            self._last_vram_cap = vram_cap if vram_cap is None else max(1, int(vram_cap))
+            effective_target = self._effective_target_locked(vram_cap=vram_cap)
+            can_grow = self._can_grow_locked(vram_cap=vram_cap)
+            if self._last_batch_texts >= self._current_target and can_grow:
+                self._current_target = min(self._current_target + self._STEP, self._hard_cap)
+                self._saturated_batches += 1
+                self._underfilled_batches = 0
+                self._adjustments_total += 1
+                return
+
+            can_shrink = self._last_vram_cap is None or self._last_vram_cap >= self._current_target
+            if (
+                can_shrink
+                and self._current_target > self._min_target
+                and self._last_batch_texts < max(1, effective_target // 2)
+            ):
+                self._underfilled_batches += 1
+                self._saturated_batches = 0
+                if self._underfilled_batches >= self._UNDERFILLED_SHRINK_THRESHOLD:
+                    self._current_target = max(self._min_target, self._current_target - self._STEP)
+                    self._underfilled_batches = 0
+                    self._adjustments_total += 1
+                return
+
+            self._saturated_batches = 0
+            self._underfilled_batches = 0
+
+    def snapshot(self) -> dict[str, int | None]:
+        with self._lock:
+            return {
+                "current_target": self._current_target,
+                "initial_target": self._initial_target,
+                "hard_cap": self._hard_cap,
+                "min_target": self._min_target,
+                "max_target": self._DEFAULT_MAX_TARGET,
+                "last_batch_texts": self._last_batch_texts,
+                "last_vram_cap": self._last_vram_cap,
+                "saturated_batches": self._saturated_batches,
+                "underfilled_batches": self._underfilled_batches,
+                "adjustments_total": self._adjustments_total,
+            }
+
+    def _effective_target_locked(self, *, vram_cap: int | None) -> int:
+        target = min(self._current_target, self._hard_cap)
+        if vram_cap is not None:
+            target = min(target, max(1, int(vram_cap)))
+        return max(1, target)
+
+    def _can_grow_locked(self, *, vram_cap: int | None) -> bool:
+        if self._current_target >= self._hard_cap:
+            return False
+        next_target = min(self._current_target + self._STEP, self._hard_cap)
+        return vram_cap is None or int(vram_cap) >= next_target
+
+
 class EmbeddingRequest(BaseModel):
     input: str | list[str]
     model: str | None = None
@@ -344,6 +439,7 @@ class EmbedderRuntime:
         self._last_offloaded_at: float | None = None
         self._idle_offload_enabled = self._use_gpu_worker and settings.idle_offload_seconds > 0
         self._stats: ProviderRuntimeStats | None = None
+        self.adaptive_batch = AdaptiveBatchState(settings.max_batch_size)
 
     def attach_stats(self, stats: ProviderRuntimeStats) -> None:
         self._stats = stats
@@ -404,6 +500,7 @@ class EmbedderRuntime:
                 "offloaded_for_seconds": round(offloaded_for, 3) if offloaded_for is not None else None,
                 "reload_in_progress": self._reload_in_progress,
                 "worker_pid": self._gpu_worker.pid if self._gpu_worker is not None and self._gpu_worker.is_running() else None,
+                "adaptive_batch": self.adaptive_batch.snapshot(),
             }
 
     def close(self) -> None:
@@ -424,6 +521,7 @@ class EmbedderRuntime:
             if self._use_gpu_worker:
                 if self._gpu_worker is not None:
                     self._gpu_worker.terminate()
+                self.adaptive_batch.reset()
                 with self._model_lock:
                     self._device = "cpu"
                     self.device_name = "none"
@@ -432,6 +530,7 @@ class EmbedderRuntime:
             else:
                 next_model = self._load_model(device_override="cpu")
                 self._swap_model(next_model, "cpu", engine_state="offloaded")
+                self.adaptive_batch.reset()
             if self._stats is not None:
                 self._stats.record_offload()
             return True
@@ -610,7 +709,7 @@ class EmbedderRuntime:
     def encode(self, texts: list[str], *, dimensions: int | None = None, task: str | None = None) -> list[list[float]]:
         self._begin_encode()
         try:
-            max_batch_size = self._settings.max_batch_size or len(texts)
+            max_batch_size = self.estimate_max_texts()
             embeddings: list[list[float]] = []
             for chunk in _batched(texts, max_batch_size):
                 embeddings.extend(self._encode_with_backoff(chunk, dimensions=dimensions, task=task))
@@ -622,11 +721,11 @@ class EmbedderRuntime:
         """Return a safe upper bound on texts for the next forward pass based on free VRAM."""
         hard_cap = self._settings.max_batch_size
         if self._preferred_device != "cuda":
-            return hard_cap or 256
+            return self.adaptive_batch.effective_target(vram_cap=hard_cap or 256)
 
         free, total = _probe_cuda_memory_bytes()
         if free is None or total is None:
-            return hard_cap or 256
+            return self.adaptive_batch.effective_target(vram_cap=hard_cap or 256)
         # Reserve 512 MB + 5% of total as headroom for CUDA context, cuBLAS workspace, etc.
         safety = int(512 * 1024 * 1024) + int(total * 0.05)
         usable = max(0, free - safety)
@@ -639,7 +738,10 @@ class EmbedderRuntime:
 
         if hard_cap:
             estimate = min(estimate, hard_cap)
-        return max(1, estimate)
+        return self.adaptive_batch.effective_target(vram_cap=max(1, estimate))
+
+    def record_batch_dispatch(self, *, text_count: int, vram_cap: int | None) -> None:
+        self.adaptive_batch.record_dispatch(text_count=text_count, vram_cap=vram_cap)
 
 
 @dataclass
@@ -772,6 +874,9 @@ class ContinuousBatcher:
                 embeddings: list[list[float]] = await loop.run_in_executor(None, fn)
                 for item, offset in zip(to_process, offsets):
                     item.future.set_result(embeddings[offset: offset + len(item.texts)])
+                record_dispatch = getattr(self._runtime, "record_batch_dispatch", None)
+                if callable(record_dispatch):
+                    record_dispatch(text_count=text_count, vram_cap=max_texts)
             except Exception as exc:
                 for item in to_process:
                     if not item.future.done():

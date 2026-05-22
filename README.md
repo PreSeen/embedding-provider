@@ -87,7 +87,8 @@ curl http://127.0.0.1:8000/statsz
 - Current service bind on `gpu4`: `127.0.0.1:7997`
 - Provider defaults:
   - `MAX_LENGTH=8192`
-  - `MAX_BATCH_SIZE=8`
+  - `MAX_BATCH_SIZE=64`
+  - adaptive batch target starts at `8`, grows as `8 -> 16 -> 24 -> ... -> 64` when demand fills the current target, and shrinks after repeated underfilled dispatches
   - `DEFAULT_DIMENSIONS=768`
   - `IDLE_OFFLOAD_SECONDS=1800`
 
@@ -101,10 +102,11 @@ On CUDA hosts, the provider now keeps the HTTP process alive but moves the loade
 When idle offload is enabled:
 
 - an unused embedding model vacates VRAM after the configured idle threshold because the GPU worker exits
+- idle offload resets the adaptive batch target back to `8`
 - the next embedding request automatically starts a fresh GPU worker before inference
 - `/healthz` exposes a `runtime` block with `loaded_device`, `engine_state`, `idle_for_seconds`, `reload_in_progress`, and `worker_pid`
 - `/readyz` distinguishes “process is alive” from “service is ready to accept embedding requests”
-- `/statsz` exposes request counters, queue depth, last error summary, and reload/offload counters
+- `/statsz` exposes request counters, queue depth, adaptive batch state, last error summary, and reload/offload counters
 
 This only affects the embedding-provider process itself. It does not touch the OCR service, system CUDA, or other GPU workloads on the host.
 
