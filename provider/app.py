@@ -230,13 +230,15 @@ class AdaptiveBatchState:
                 self._current_target = next_target
                 self._adjustments_total += 1
 
-    def record_request_complete(self, *, total_texts: int, request_start_target: int) -> None:
+    def record_request_complete(self, *, total_texts: int, request_start_target: int) -> bool:
         with self._lock:
             if total_texts < request_start_target:
                 next_target = max(self._initial_target, min(self._hard_cap, int(total_texts)))
                 if next_target != self._current_target:
                     self._current_target = next_target
                     self._adjustments_total += 1
+                    return True
+            return False
 
     def snapshot(self) -> dict[str, int | None]:
         with self._lock:
@@ -352,6 +354,9 @@ class _GpuEmbedderWorker:
         embeddings = [[float(value) for value in row] for row in response.get("embeddings") or []]
         sample = response.get("sample_bytes_per_text")
         return embeddings, float(sample) if sample is not None else None
+
+    def empty_cache(self) -> None:
+        self._request({"op": "empty_cache"})
 
     def terminate(self) -> None:
         with self._io_lock:
@@ -562,6 +567,20 @@ class EmbedderRuntime:
             self._last_encode_finished_at = time.monotonic()
             self._model_lock.notify_all()
 
+    def _release_cuda_cache(self) -> None:
+        if self._preferred_device != "cuda":
+            return
+        try:
+            if self._use_gpu_worker:
+                if self._gpu_worker is not None and self._gpu_worker.is_running():
+                    self._gpu_worker.empty_cache()
+                return
+            import torch
+
+            torch.cuda.empty_cache()
+        except Exception:
+            log.warning("failed to release CUDA cache after adaptive batch shrink", exc_info=True)
+
     def _swap_model(self, next_model: Any, next_device: str, *, engine_state: str) -> None:
         if self._use_gpu_worker:
             raise RuntimeError("_swap_model is unavailable in GPU worker mode")
@@ -710,10 +729,12 @@ class EmbedderRuntime:
                         allow_growth=offset < len(texts),
                     )
             if cuda_request_start_target is not None and len(texts) < cuda_request_start_target:
-                self.adaptive_batch.record_request_complete(
+                shrank = self.adaptive_batch.record_request_complete(
                     total_texts=len(texts),
                     request_start_target=cuda_request_start_target,
                 )
+                if shrank:
+                    self._release_cuda_cache()
             return embeddings
         finally:
             self._finish_encode()

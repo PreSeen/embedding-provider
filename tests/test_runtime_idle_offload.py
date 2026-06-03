@@ -90,6 +90,7 @@ class FakeWorker:
         self.starts = 0
         self.stops = 0
         self.batch_sizes: list[int] = []
+        self.cache_releases = 0
 
     @property
     def pid(self) -> int | None:
@@ -108,6 +109,9 @@ class FakeWorker:
         self.batch_sizes.append(len(texts))
         width = dimensions or 4
         return np.ones((len(texts), width), dtype=np.float32).tolist(), 1024.0
+
+    def empty_cache(self) -> None:
+        self.cache_releases += 1
 
     def terminate(self) -> None:
         if self.running:
@@ -257,6 +261,7 @@ class EmbedderRuntimeIdleOffloadTests(unittest.TestCase):
 
         self.assertEqual(len(workers), 1)
         self.assertEqual(workers[0].batch_sizes, [1, 2, 4, 1, 2, 2, 3])
+        self.assertEqual(workers[0].cache_releases, 1)
 
 
 if __name__ == "__main__":

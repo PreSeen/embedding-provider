@@ -240,8 +240,12 @@ def test_adaptive_batch_state_respects_request_shrink_and_reset() -> None:
 
     assert state.current_target == 8
 
-    state.record_request_complete(total_texts=2, request_start_target=8)
+    shrank = state.record_request_complete(total_texts=2, request_start_target=8)
+    assert shrank is True
     assert state.current_target == 2
+
+    shrank = state.record_request_complete(total_texts=2, request_start_target=2)
+    assert shrank is False
 
     state.reset()
     assert state.current_target == 1

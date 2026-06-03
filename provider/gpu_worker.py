@@ -128,6 +128,10 @@ def main() -> int:
         if op == "shutdown":
             _emit({"status": "ok"})
             return 0
+        if op == "empty_cache":
+            torch.cuda.empty_cache()
+            _emit({"status": "ok"})
+            continue
         if op != "encode":
             _emit({"status": "error", "error": f"unsupported op: {op}"})
             continue
