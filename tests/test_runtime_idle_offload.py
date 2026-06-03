@@ -119,6 +119,12 @@ class FakeWorker:
         self.running = False
 
 
+class FailingStartWorker(FakeWorker):
+    def ensure_started(self) -> str:
+        self.starts += 1
+        raise RuntimeError("CUDA out of memory while loading model")
+
+
 class EmbedderRuntimeIdleOffloadTests(unittest.TestCase):
     def setUp(self) -> None:
         self._env_stack = ExitStack()
@@ -191,6 +197,35 @@ class EmbedderRuntimeIdleOffloadTests(unittest.TestCase):
                 self.assertEqual(runtime.estimate_max_texts(), 1)
             finally:
                 runtime.close()
+
+    def test_gpu_worker_start_failure_falls_back_to_cpu(self) -> None:
+        workers: list[FailingStartWorker] = []
+
+        def fake_worker_factory(settings: Settings) -> FailingStartWorker:
+            worker = FailingStartWorker(settings)
+            workers.append(worker)
+            return worker
+
+        with (
+            patch("provider.app._GpuEmbedderWorker", side_effect=fake_worker_factory),
+            patch("provider.app._detect_preferred_device", return_value="cuda"),
+            patch("provider.app._probe_cuda_memory_bytes", return_value=(8 * 1024**3, 24 * 1024**3)),
+        ):
+            runtime = EmbedderRuntime(Settings.from_env())
+            try:
+                embeddings = runtime.encode(["fallback"])
+                status = runtime.runtime_status()
+            finally:
+                runtime.close()
+
+        self.assertEqual(len(embeddings), 1)
+        self.assertEqual(status["detected_device"], "cuda")
+        self.assertEqual(status["preferred_device"], "cpu")
+        self.assertEqual(status["loaded_device"], "cpu")
+        self.assertEqual(status["engine_state"], "hot")
+        self.assertFalse(status["idle_offload_enabled"])
+        self.assertIn("CUDA out of memory", status["cuda_fallback_reason"])
+        self.assertEqual(workers[0].starts, 1)
 
     def test_encode_splits_static_batch_size_by_available_vram_cap(self) -> None:
         workers: list[FakeWorker] = []

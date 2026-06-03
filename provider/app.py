@@ -405,7 +405,8 @@ class _GpuEmbedderWorker:
 class EmbedderRuntime:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
-        self._preferred_device = _detect_preferred_device()
+        self._detected_device = _detect_preferred_device()
+        self._preferred_device = self._detected_device
         self._device = self._preferred_device
         self.device_name = "none" if self._preferred_device == "cuda" else self._device
         self._model_lock = threading.Condition()
@@ -423,6 +424,7 @@ class EmbedderRuntime:
         self._last_offloaded_at: float | None = None
         self._idle_offload_enabled = self._use_gpu_worker and settings.idle_offload_seconds > 0
         self._stats: ProviderRuntimeStats | None = None
+        self._cuda_fallback_reason: str | None = None
 
     def attach_stats(self, stats: ProviderRuntimeStats) -> None:
         self._stats = stats
@@ -472,7 +474,9 @@ class EmbedderRuntime:
             return {
                 "loaded_device": self.device_name,
                 "preferred_device": self._preferred_device,
+                "detected_device": self._detected_device,
                 "engine_state": self._engine_state,
+                "cuda_fallback_reason": self._cuda_fallback_reason,
                 "idle_offload_enabled": self._idle_offload_enabled,
                 "idle_offload_seconds": self._settings.idle_offload_seconds if self._idle_offload_enabled else None,
                 "idle_offload_poll_seconds": (
@@ -535,7 +539,11 @@ class EmbedderRuntime:
             if self._use_gpu_worker:
                 if self._gpu_worker is None:
                     raise RuntimeError("embedding GPU worker is unavailable")
-                device_name = self._gpu_worker.ensure_started()
+                try:
+                    device_name = self._gpu_worker.ensure_started()
+                except Exception as exc:
+                    self._fallback_to_cpu(exc)
+                    return
                 with self._model_lock:
                     self._device = device_name
                     self.device_name = device_name
@@ -581,6 +589,25 @@ class EmbedderRuntime:
         except Exception:
             log.warning("failed to release CUDA cache after adaptive batch shrink", exc_info=True)
 
+    def _fallback_to_cpu(self, exc: Exception) -> None:
+        reason = str(exc) or repr(exc)
+        log.warning("embedding GPU worker failed to start; falling back to CPU: %s", reason)
+        if self._gpu_worker is not None:
+            self._gpu_worker.terminate()
+        next_model = self._load_model(device_override="cpu")
+        with self._model_lock:
+            self._gpu_worker = None
+            self._use_gpu_worker = False
+            self._preferred_device = "cpu"
+            self._device = "cpu"
+            self.device_name = "cpu"
+            self._model = next_model
+            self._encode_signature = inspect.signature(self._model.encode)
+            self._engine_state = "hot"
+            self._last_offloaded_at = None
+            self._idle_offload_enabled = False
+            self._cuda_fallback_reason = reason
+
     def _swap_model(self, next_model: Any, next_device: str, *, engine_state: str) -> None:
         if self._use_gpu_worker:
             raise RuntimeError("_swap_model is unavailable in GPU worker mode")
@@ -607,7 +634,11 @@ class EmbedderRuntime:
         if self._use_gpu_worker:
             if self._gpu_worker is None:
                 raise RuntimeError("embedding GPU worker is unavailable")
-            device_name = self._gpu_worker.ensure_started()
+            try:
+                device_name = self._gpu_worker.ensure_started()
+            except Exception as exc:
+                self._fallback_to_cpu(exc)
+                return self._encode_once(texts, dimensions=dimensions, task=task)
             with self._model_lock:
                 self._device = device_name
                 self.device_name = device_name
