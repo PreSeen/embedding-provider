@@ -46,7 +46,7 @@ class Settings:
             embedding_task=os.getenv("EMBEDDING_TASK") or None,
             default_dimensions=_env_int("DEFAULT_DIMENSIONS", "768"),
             max_length=_env_int("MAX_LENGTH", "8192"),
-            max_batch_size=_env_int("MAX_BATCH_SIZE", "8"),
+            max_batch_size=_env_int("MAX_BATCH_SIZE", "64"),
             normalize_embeddings=_env_bool("NORMALIZE_EMBEDDINGS", True),
             dtype=os.getenv("DTYPE", "bfloat16"),
             attn_implementation=os.getenv("ATTN_IMPLEMENTATION") or None,

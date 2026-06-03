@@ -30,6 +30,10 @@ from provider.config import Settings
 log = logging.getLogger("embedding_provider")
 logging.basicConfig(level="INFO")
 
+_CUDA_VRAM_SAFETY_FIXED_BYTES = 512 * 1024 * 1024
+_CUDA_VRAM_SAFETY_TOTAL_RATIO = 0.05
+_CUDA_BATCH_GROWTH_FACTOR = 2
+
 
 def _batched(values: list[str], batch_size: int) -> list[list[str]]:
     if batch_size <= 0:
@@ -181,6 +185,75 @@ class ProviderRuntimeStats:
                 "last_error_summary": self._last_error_summary,
                 "last_duration_ms": self._last_duration_ms,
             }
+
+
+class AdaptiveBatchState:
+    _DEFAULT_MAX_TARGET = 64
+    _MIN_TARGET = 1
+
+    def __init__(self, configured_max_batch_size: int | None) -> None:
+        configured_cap = configured_max_batch_size or self._DEFAULT_MAX_TARGET
+        self._hard_cap = max(1, int(configured_cap))
+        self._initial_target = min(self._MIN_TARGET, self._hard_cap)
+        self._current_target = self._initial_target
+        self._last_batch_texts = 0
+        self._last_vram_cap: int | None = None
+        self._adjustments_total = 0
+        self._lock = threading.Lock()
+
+    @property
+    def current_target(self) -> int:
+        with self._lock:
+            return self._current_target
+
+    def effective_target(self, *, vram_cap: int | None = None) -> int:
+        with self._lock:
+            return self._effective_target_locked(vram_cap=vram_cap)
+
+    def reset(self) -> None:
+        with self._lock:
+            self._current_target = self._initial_target
+            self._last_batch_texts = 0
+            self._last_vram_cap = None
+            self._adjustments_total += 1
+
+    def record_successful_dispatch(self, *, text_count: int, vram_cap: int | None, allow_growth: bool) -> None:
+        with self._lock:
+            self._last_batch_texts = max(0, int(text_count))
+            self._last_vram_cap = vram_cap if vram_cap is None else max(1, int(vram_cap))
+            if not allow_growth or self._last_batch_texts < self._current_target:
+                return
+            next_target = min(self._hard_cap, max(1, self._current_target * _CUDA_BATCH_GROWTH_FACTOR))
+            if self._last_vram_cap is not None:
+                next_target = min(next_target, self._last_vram_cap)
+            if next_target > self._current_target:
+                self._current_target = next_target
+                self._adjustments_total += 1
+
+    def record_request_complete(self, *, total_texts: int, request_start_target: int) -> None:
+        with self._lock:
+            if total_texts < request_start_target:
+                next_target = max(self._initial_target, min(self._hard_cap, int(total_texts)))
+                if next_target != self._current_target:
+                    self._current_target = next_target
+                    self._adjustments_total += 1
+
+    def snapshot(self) -> dict[str, int | None]:
+        with self._lock:
+            return {
+                "current_target": self._current_target,
+                "initial_target": self._initial_target,
+                "hard_cap": self._hard_cap,
+                "last_batch_texts": self._last_batch_texts,
+                "last_vram_cap": self._last_vram_cap,
+                "adjustments_total": self._adjustments_total,
+            }
+
+    def _effective_target_locked(self, *, vram_cap: int | None) -> int:
+        target = min(self._current_target, self._hard_cap)
+        if vram_cap is not None:
+            target = min(target, max(1, int(vram_cap)))
+        return max(1, target)
 
 
 class EmbeddingRequest(BaseModel):
@@ -337,6 +410,7 @@ class EmbedderRuntime:
         self._encode_signature = None if self._model is None else inspect.signature(self._model.encode)
         self._bytes_per_text_ema: float | None = None
         self._ema_alpha = 0.25
+        self.adaptive_batch = AdaptiveBatchState(settings.max_batch_size)
         self._engine_state = "offloaded" if self._use_gpu_worker else "hot"
         self._reload_in_progress = False
         self._inflight_encodes = 0
@@ -404,6 +478,7 @@ class EmbedderRuntime:
                 "offloaded_for_seconds": round(offloaded_for, 3) if offloaded_for is not None else None,
                 "reload_in_progress": self._reload_in_progress,
                 "worker_pid": self._gpu_worker.pid if self._gpu_worker is not None and self._gpu_worker.is_running() else None,
+                "adaptive_batch": self.adaptive_batch.snapshot(),
             }
 
     def close(self) -> None:
@@ -424,6 +499,7 @@ class EmbedderRuntime:
             if self._use_gpu_worker:
                 if self._gpu_worker is not None:
                     self._gpu_worker.terminate()
+                self.adaptive_batch.reset()
                 with self._model_lock:
                     self._device = "cpu"
                     self.device_name = "none"
@@ -432,6 +508,7 @@ class EmbedderRuntime:
             else:
                 next_model = self._load_model(device_override="cpu")
                 self._swap_model(next_model, "cpu", engine_state="offloaded")
+                self.adaptive_batch.reset()
             if self._stats is not None:
                 self._stats.record_offload()
             return True
@@ -610,15 +687,44 @@ class EmbedderRuntime:
     def encode(self, texts: list[str], *, dimensions: int | None = None, task: str | None = None) -> list[list[float]]:
         self._begin_encode()
         try:
-            max_batch_size = self._settings.max_batch_size or len(texts)
             embeddings: list[list[float]] = []
-            for chunk in _batched(texts, max_batch_size):
+            offset = 0
+            cuda_request_start_target = self.adaptive_batch.current_target if self._preferred_device == "cuda" else None
+            while offset < len(texts):
+                remaining = len(texts) - offset
+                max_batch_size = self._settings.max_batch_size or remaining
+                vram_cap: int | None = None
+                chunk_target = max_batch_size
+                if self._preferred_device == "cuda":
+                    vram_cap = self._estimate_vram_text_cap()
+                    chunk_target = min(max_batch_size, self.adaptive_batch.effective_target(vram_cap=vram_cap))
+                chunk_size = max(1, min(chunk_target, remaining))
+                chunk = texts[offset: offset + chunk_size]
                 embeddings.extend(self._encode_with_backoff(chunk, dimensions=dimensions, task=task))
+                offset += chunk_size
+                if self._preferred_device == "cuda":
+                    vram_cap = self._estimate_vram_text_cap()
+                    self.adaptive_batch.record_successful_dispatch(
+                        text_count=chunk_size,
+                        vram_cap=vram_cap,
+                        allow_growth=offset < len(texts),
+                    )
+            if cuda_request_start_target is not None and len(texts) < cuda_request_start_target:
+                self.adaptive_batch.record_request_complete(
+                    total_texts=len(texts),
+                    request_start_target=cuda_request_start_target,
+                )
             return embeddings
         finally:
             self._finish_encode()
 
     def estimate_max_texts(self) -> int:
+        vram_cap = self._estimate_vram_text_cap()
+        if self._preferred_device == "cuda":
+            return self.adaptive_batch.effective_target(vram_cap=vram_cap)
+        return vram_cap
+
+    def _estimate_vram_text_cap(self) -> int:
         """Return a safe upper bound on texts for the next forward pass based on free VRAM."""
         hard_cap = self._settings.max_batch_size
         if self._preferred_device != "cuda":
@@ -627,13 +733,10 @@ class EmbedderRuntime:
         free, total = _probe_cuda_memory_bytes()
         if free is None or total is None:
             return hard_cap or 256
-        # Reserve 512 MB + 5% of total as headroom for CUDA context, cuBLAS workspace, etc.
-        safety = int(512 * 1024 * 1024) + int(total * 0.05)
-        usable = max(0, free - safety)
-
-        if self._bytes_per_text_ema is None or self._bytes_per_text_ema <= 0:
-            # No measurements yet — conservative default until EMA warms up.
-            estimate = 32
+        safety = _CUDA_VRAM_SAFETY_FIXED_BYTES + int(total * _CUDA_VRAM_SAFETY_TOTAL_RATIO)
+        usable = free - safety
+        if usable <= 0 or self._bytes_per_text_ema is None or self._bytes_per_text_ema <= 0:
+            estimate = 1
         else:
             estimate = max(1, int(usable / self._bytes_per_text_ema))
 

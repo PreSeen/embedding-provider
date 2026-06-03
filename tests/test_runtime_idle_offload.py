@@ -89,6 +89,7 @@ class FakeWorker:
         self.running = False
         self.starts = 0
         self.stops = 0
+        self.batch_sizes: list[int] = []
 
     @property
     def pid(self) -> int | None:
@@ -104,6 +105,7 @@ class FakeWorker:
 
     def encode(self, texts: list[str], *, dimensions: int | None = None, task: str | None = None):
         self.ensure_started()
+        self.batch_sizes.append(len(texts))
         width = dimensions or 4
         return np.ones((len(texts), width), dtype=np.float32).tolist(), 1024.0
 
@@ -173,6 +175,88 @@ class EmbedderRuntimeIdleOffloadTests(unittest.TestCase):
         self.assertEqual(len(workers), 1)
         self.assertGreaterEqual(workers[0].starts, 1)
         self.assertGreaterEqual(workers[0].stops, 1)
+
+    def test_estimate_max_texts_drops_to_one_when_free_vram_is_below_safety_margin(self) -> None:
+        with (
+            patch("provider.app._GpuEmbedderWorker", FakeWorker),
+            patch("provider.app._detect_preferred_device", return_value="cuda"),
+            patch("provider.app._probe_cuda_memory_bytes", return_value=(512 * 1024**2, 24 * 1024**3)),
+        ):
+            runtime = EmbedderRuntime(Settings.from_env())
+            try:
+                self.assertEqual(runtime.estimate_max_texts(), 1)
+            finally:
+                runtime.close()
+
+    def test_encode_splits_static_batch_size_by_available_vram_cap(self) -> None:
+        workers: list[FakeWorker] = []
+
+        def fake_worker_factory(settings: Settings) -> FakeWorker:
+            worker = FakeWorker(settings)
+            workers.append(worker)
+            return worker
+
+        with (
+            patch("provider.app._GpuEmbedderWorker", side_effect=fake_worker_factory),
+            patch("provider.app._detect_preferred_device", return_value="cuda"),
+            patch("provider.app._probe_cuda_memory_bytes", return_value=(512 * 1024**2, 24 * 1024**3)),
+        ):
+            runtime = EmbedderRuntime(Settings.from_env())
+            try:
+                embeddings = runtime.encode(["alpha", "beta", "gamma"])
+            finally:
+                runtime.close()
+
+        self.assertEqual(len(embeddings), 3)
+        self.assertEqual(len(workers), 1)
+        self.assertEqual(workers[0].batch_sizes, [1, 1, 1])
+
+    def test_encode_ramps_cuda_batch_size_after_first_real_measurement(self) -> None:
+        workers: list[FakeWorker] = []
+
+        def fake_worker_factory(settings: Settings) -> FakeWorker:
+            worker = FakeWorker(settings)
+            workers.append(worker)
+            return worker
+
+        with (
+            patch("provider.app._GpuEmbedderWorker", side_effect=fake_worker_factory),
+            patch("provider.app._detect_preferred_device", return_value="cuda"),
+            patch("provider.app._probe_cuda_memory_bytes", return_value=(8 * 1024**3, 24 * 1024**3)),
+        ):
+            runtime = EmbedderRuntime(Settings.from_env())
+            try:
+                embeddings = runtime.encode(["alpha", "beta", "gamma", "delta"])
+            finally:
+                runtime.close()
+
+        self.assertEqual(len(embeddings), 4)
+        self.assertEqual(len(workers), 1)
+        self.assertEqual(workers[0].batch_sizes, [1, 2, 1])
+
+    def test_cuda_batch_target_drops_when_following_request_is_smaller(self) -> None:
+        workers: list[FakeWorker] = []
+
+        def fake_worker_factory(settings: Settings) -> FakeWorker:
+            worker = FakeWorker(settings)
+            workers.append(worker)
+            return worker
+
+        with (
+            patch("provider.app._GpuEmbedderWorker", side_effect=fake_worker_factory),
+            patch("provider.app._detect_preferred_device", return_value="cuda"),
+            patch("provider.app._probe_cuda_memory_bytes", return_value=(8 * 1024**3, 24 * 1024**3)),
+        ):
+            runtime = EmbedderRuntime(Settings.from_env())
+            try:
+                runtime.encode([f"large-{idx}" for idx in range(8)])
+                runtime.encode(["small-a", "small-b"])
+                runtime.encode([f"again-{idx}" for idx in range(5)])
+            finally:
+                runtime.close()
+
+        self.assertEqual(len(workers), 1)
+        self.assertEqual(workers[0].batch_sizes, [1, 2, 4, 1, 2, 2, 3])
 
 
 if __name__ == "__main__":

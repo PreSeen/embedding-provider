@@ -7,7 +7,7 @@ from typing import Any
 
 import numpy as np
 import torch
-from transformers import AutoModel
+from transformers import AutoModel, AutoTokenizer
 
 from provider.config import Settings
 
@@ -48,6 +48,40 @@ def _outputs_to_numpy(outputs: Any) -> np.ndarray:
     return np.asarray(outputs, dtype=np.float32)
 
 
+class _MeanPoolEncoder:
+    """Wrap a bare AutoModel (e.g. decoder-only Qwen3) with an .encode() interface.
+
+    Uses last-hidden-state mean pooling with attention mask weighting,
+    matching the standard Qwen3-Embedding inference recipe.
+    """
+
+    def __init__(self, model: Any, tokenizer: Any, device: torch.device) -> None:
+        self._model = model
+        self._tokenizer = tokenizer
+        self._device = device
+
+    def encode(
+        self,
+        sentences: list[str],
+        max_length: int | None = None,
+        **_kwargs: Any,
+    ) -> np.ndarray:
+        tok_kwargs: dict[str, Any] = {
+            "padding": True,
+            "truncation": True,
+            "return_tensors": "pt",
+        }
+        if max_length:
+            tok_kwargs["max_length"] = max_length
+        encoded = self._tokenizer(sentences, **tok_kwargs).to(self._device)
+        with torch.no_grad():
+            out = self._model(**encoded)
+        hidden = out.last_hidden_state  # (B, T, D)
+        mask = encoded["attention_mask"].unsqueeze(-1).float()  # (B, T, 1)
+        pooled = (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-9)
+        return pooled.float().cpu().numpy()
+
+
 def _load_model(settings: Settings) -> Any:
     kwargs: dict[str, Any] = {
         "trust_remote_code": settings.trust_remote_code,
@@ -61,10 +95,16 @@ def _load_model(settings: Settings) -> Any:
         log.warning("model load with custom attention failed; retrying without attn_implementation", exc_info=True)
         kwargs.pop("attn_implementation", None)
         model = AutoModel.from_pretrained(settings.model_id, **kwargs)
+    device = torch.device("cuda")
     if hasattr(model, "to"):
-        model = model.to(torch.device("cuda"))
+        model = model.to(device)
     if hasattr(model, "eval"):
         model.eval()
+    if not hasattr(model, "encode"):
+        tokenizer = AutoTokenizer.from_pretrained(
+            settings.model_id, trust_remote_code=settings.trust_remote_code
+        )
+        model = _MeanPoolEncoder(model, tokenizer, device)
     return model
 
 

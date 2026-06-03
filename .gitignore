@@ -3,9 +3,12 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 *.pyc
+*.egg-info/
 .env
 data/
 runtime/
 runtime-cache/
 deployments/**/*.env
+deployments/**/*.env.bak
+deployments/**/*.env.bak.*
 *.env.local

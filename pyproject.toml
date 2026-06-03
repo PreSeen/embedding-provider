@@ -17,3 +17,6 @@ dependencies = [
 
 [tool.setuptools]
 packages = ["provider"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

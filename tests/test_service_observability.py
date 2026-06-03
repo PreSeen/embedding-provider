@@ -73,7 +73,7 @@ if "transformers" not in sys.modules:
     fake_transformers.AutoModel = _FakeAutoModel
     sys.modules["transformers"] = fake_transformers
 
-from provider.app import create_app
+from provider.app import AdaptiveBatchState, create_app
 from provider.config import Settings
 
 
@@ -215,3 +215,34 @@ def test_embeddings_failure_updates_error_stats_and_preserves_request_id() -> No
         assert stats["requests_failed"] == 1
         assert stats["last_error_request_id"] == "embed-req-fail"
         assert "ValueError" in str(stats["last_error_summary"])
+
+
+def test_adaptive_batch_state_grows_conservatively_after_full_dispatches() -> None:
+    state = AdaptiveBatchState(configured_max_batch_size=64)
+
+    assert state.current_target == 1
+
+    state.record_successful_dispatch(text_count=1, vram_cap=64, allow_growth=True)
+    assert state.current_target == 2
+
+    state.record_successful_dispatch(text_count=2, vram_cap=64, allow_growth=True)
+    assert state.current_target == 4
+
+    state.record_successful_dispatch(text_count=4, vram_cap=3, allow_growth=True)
+    assert state.current_target == 4
+
+
+def test_adaptive_batch_state_respects_request_shrink_and_reset() -> None:
+    state = AdaptiveBatchState(configured_max_batch_size=64)
+    state.record_successful_dispatch(text_count=1, vram_cap=64, allow_growth=True)
+    state.record_successful_dispatch(text_count=2, vram_cap=64, allow_growth=True)
+    state.record_successful_dispatch(text_count=4, vram_cap=64, allow_growth=True)
+
+    assert state.current_target == 8
+
+    state.record_request_complete(total_texts=2, request_start_target=8)
+    assert state.current_target == 2
+
+    state.reset()
+    assert state.current_target == 1
+    assert state.snapshot()["last_batch_texts"] == 0
