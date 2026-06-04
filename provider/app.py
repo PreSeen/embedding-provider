@@ -33,6 +33,7 @@ logging.basicConfig(level="INFO")
 _CUDA_VRAM_SAFETY_FIXED_BYTES = 512 * 1024 * 1024
 _CUDA_VRAM_SAFETY_TOTAL_RATIO = 0.05
 _CUDA_BATCH_GROWTH_FACTOR = 2
+_CPU_TO_GPU_SCALE_UP_TEXTS = 2
 
 
 def _batched(values: list[str], batch_size: int) -> list[list[str]]:
@@ -422,7 +423,7 @@ class EmbedderRuntime:
         self._inflight_encodes = 0
         self._last_encode_finished_at = time.monotonic()
         self._last_offloaded_at: float | None = None
-        self._idle_offload_enabled = self._use_gpu_worker and settings.idle_offload_seconds > 0
+        self._idle_offload_enabled = self._detected_device == "cuda" and settings.idle_offload_seconds > 0
         self._stats: ProviderRuntimeStats | None = None
         self._cuda_fallback_reason: str | None = None
 
@@ -498,7 +499,7 @@ class EmbedderRuntime:
         if not self._idle_offload_enabled:
             return False
         with self._model_lock:
-            if self._reload_in_progress or self._engine_state == "offloaded" or self._inflight_encodes > 0:
+            if self._reload_in_progress or self.device_name == "cpu" or self._inflight_encodes > 0:
                 return False
             idle_for = time.monotonic() - self._last_encode_finished_at
             if idle_for < self._settings.idle_offload_seconds:
@@ -509,14 +510,22 @@ class EmbedderRuntime:
                 if self._gpu_worker is not None:
                     self._gpu_worker.terminate()
                 self.adaptive_batch.reset()
+                next_model = self._load_model(device_override="cpu")
                 with self._model_lock:
+                    self._use_gpu_worker = False
+                    self._preferred_device = "cpu"
                     self._device = "cpu"
-                    self.device_name = "none"
-                    self._engine_state = "offloaded"
+                    self.device_name = "cpu"
+                    self._model = next_model
+                    self._encode_signature = inspect.signature(self._model.encode)
+                    self._engine_state = "hot"
                     self._last_offloaded_at = time.monotonic()
             else:
                 next_model = self._load_model(device_override="cpu")
-                self._swap_model(next_model, "cpu", engine_state="offloaded")
+                self._swap_model(next_model, "cpu", engine_state="hot")
+                with self._model_lock:
+                    self._preferred_device = "cpu"
+                    self._last_offloaded_at = time.monotonic()
                 self.adaptive_batch.reset()
             if self._stats is not None:
                 self._stats.record_offload()
@@ -559,12 +568,56 @@ class EmbedderRuntime:
                 self._reload_in_progress = False
                 self._model_lock.notify_all()
 
-    def _begin_encode(self) -> None:
+    def _maybe_scale_up_for_request(self, text_count: int) -> None:
+        if (
+            text_count < _CPU_TO_GPU_SCALE_UP_TEXTS
+            or self._detected_device != "cuda"
+            or self._cuda_fallback_reason is not None
+        ):
+            return
+        with self._model_lock:
+            while self._reload_in_progress:
+                self._model_lock.wait()
+            if self._use_gpu_worker or self.device_name != "cpu":
+                return
+            self._reload_in_progress = True
+        worker = _GpuEmbedderWorker(self._settings)
+        try:
+            try:
+                device_name = worker.ensure_started()
+            except Exception as exc:
+                worker.terminate()
+                self._fallback_to_cpu(exc)
+                return
+            with self._model_lock:
+                old_model = self._model
+                self._model = None
+                self._encode_signature = None
+                self._gpu_worker = worker
+                self._use_gpu_worker = True
+                self._preferred_device = "cuda"
+                self._device = device_name
+                self.device_name = device_name
+                self._engine_state = "hot"
+                self._last_offloaded_at = None
+            if old_model is not None:
+                del old_model
+                gc.collect()
+            self.adaptive_batch.reset()
+            if self._stats is not None:
+                self._stats.record_reload()
+        finally:
+            with self._model_lock:
+                self._reload_in_progress = False
+                self._model_lock.notify_all()
+
+    def _begin_encode(self, text_count: int) -> None:
         with self._model_lock:
             self._inflight_encodes += 1
             self._model_lock.notify_all()
         try:
             self._ensure_hot_model()
+            self._maybe_scale_up_for_request(text_count)
         except Exception:
             self._finish_encode()
             raise
@@ -735,7 +788,7 @@ class EmbedderRuntime:
             return [*left, *right]
 
     def encode(self, texts: list[str], *, dimensions: int | None = None, task: str | None = None) -> list[list[float]]:
-        self._begin_encode()
+        self._begin_encode(len(texts))
         try:
             embeddings: list[list[float]] = []
             offset = 0

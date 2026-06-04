@@ -149,7 +149,7 @@ class EmbedderRuntimeIdleOffloadTests(unittest.TestCase):
     def tearDown(self) -> None:
         self._env_stack.close()
 
-    def test_idle_runtime_offloads_and_reloads(self) -> None:
+    def test_idle_runtime_scales_down_to_cpu_and_scales_up_for_batches(self) -> None:
         workers: list[FakeWorker] = []
 
         def fake_worker_factory(settings: Settings) -> FakeWorker:
@@ -173,18 +173,26 @@ class EmbedderRuntimeIdleOffloadTests(unittest.TestCase):
             runtime._last_encode_finished_at -= 2
             offloaded = runtime.maybe_offload_idle()
             self.assertTrue(offloaded)
-            self.assertEqual(runtime.runtime_status()["loaded_device"], "none")
-            self.assertEqual(runtime.runtime_status()["engine_state"], "offloaded")
+            self.assertEqual(runtime.runtime_status()["loaded_device"], "cpu")
+            self.assertEqual(runtime.runtime_status()["preferred_device"], "cpu")
+            self.assertEqual(runtime.runtime_status()["engine_state"], "hot")
 
             embeddings = runtime.encode(["hello world"])
             self.assertEqual(len(embeddings), 1)
+            self.assertEqual(runtime.runtime_status()["loaded_device"], "cpu")
+            self.assertEqual(runtime.runtime_status()["preferred_device"], "cpu")
+
+            embeddings = runtime.encode(["hello world", "again"])
+            self.assertEqual(len(embeddings), 2)
             self.assertEqual(runtime.runtime_status()["loaded_device"], "cuda")
+            self.assertEqual(runtime.runtime_status()["preferred_device"], "cuda")
             self.assertEqual(runtime.runtime_status()["engine_state"], "hot")
             runtime.close()
 
-        self.assertEqual(len(workers), 1)
+        self.assertEqual(len(workers), 2)
         self.assertGreaterEqual(workers[0].starts, 1)
         self.assertGreaterEqual(workers[0].stops, 1)
+        self.assertGreaterEqual(workers[1].starts, 1)
 
     def test_estimate_max_texts_drops_to_one_when_free_vram_is_below_safety_margin(self) -> None:
         with (
