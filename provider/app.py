@@ -444,27 +444,37 @@ class EmbedderRuntime:
         return mapping.get(self._settings.dtype.lower(), torch.bfloat16)
 
     def _load_model(self, device_override: str | None = None) -> Any:
-        import torch
-        from transformers import AutoModel
-
         target_device = device_override or self._preferred_device
-        kwargs: dict[str, Any] = {
-            "trust_remote_code": self._settings.trust_remote_code,
-            "torch_dtype": self._resolve_dtype(),
-        }
-        if self._settings.attn_implementation:
-            kwargs["attn_implementation"] = self._settings.attn_implementation
+        hide_cuda = str(target_device) == "cpu"
+        old_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+        if hide_cuda:
+            os.environ["CUDA_VISIBLE_DEVICES"] = ""
         try:
-            model = AutoModel.from_pretrained(self._settings.model_id, **kwargs)
-        except Exception:
-            log.warning("model load with custom attention failed; retrying without attn_implementation", exc_info=True)
-            kwargs.pop("attn_implementation", None)
-            model = AutoModel.from_pretrained(self._settings.model_id, **kwargs)
-        if hasattr(model, "to"):
-            model = model.to(target_device)
-        if hasattr(model, "eval"):
-            model.eval()
-        return model
+            from transformers import AutoModel
+
+            kwargs: dict[str, Any] = {
+                "trust_remote_code": self._settings.trust_remote_code,
+                "torch_dtype": self._resolve_dtype(),
+            }
+            if self._settings.attn_implementation:
+                kwargs["attn_implementation"] = self._settings.attn_implementation
+            try:
+                model = AutoModel.from_pretrained(self._settings.model_id, **kwargs)
+            except Exception:
+                log.warning("model load with custom attention failed; retrying without attn_implementation", exc_info=True)
+                kwargs.pop("attn_implementation", None)
+                model = AutoModel.from_pretrained(self._settings.model_id, **kwargs)
+            if hasattr(model, "to"):
+                model = model.to(target_device)
+            if hasattr(model, "eval"):
+                model.eval()
+            return model
+        finally:
+            if hide_cuda:
+                if old_visible_devices is None:
+                    os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+                else:
+                    os.environ["CUDA_VISIBLE_DEVICES"] = old_visible_devices
 
     def runtime_status(self) -> dict[str, Any]:
         with self._model_lock:
