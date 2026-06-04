@@ -4,6 +4,7 @@ import asyncio
 import functools
 import gc
 import inspect
+import ipaddress
 import json
 import logging
 import math
@@ -21,8 +22,8 @@ from typing import Any, Literal
 from uuid import uuid4
 
 import numpy as np
-from fastapi import FastAPI, Header, HTTPException, Response
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, Header, HTTPException, Request, Response
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from provider.config import Settings
@@ -95,6 +96,45 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _first_header_ip(value: str | None) -> str | None:
+    if not value:
+        return None
+    first = value.split(",", 1)[0].strip()
+    return first or None
+
+
+def _country_for_ip(ip_text: str | None) -> str:
+    if not ip_text:
+        return "unknown"
+    try:
+        ip = ipaddress.ip_address(ip_text)
+    except ValueError:
+        return "unknown"
+    if ip.is_loopback:
+        return "localhost"
+    if ip.is_private or ip.is_link_local:
+        return "LAN"
+    return "unknown"
+
+
+def _client_ip_and_country(request: Request) -> tuple[str | None, str]:
+    headers = request.headers
+    source_ip = (
+        _first_header_ip(headers.get("cf-connecting-ip"))
+        or _first_header_ip(headers.get("true-client-ip"))
+        or _first_header_ip(headers.get("x-real-ip"))
+        or _first_header_ip(headers.get("x-forwarded-for"))
+        or (request.client.host if request.client else None)
+    )
+    country = (
+        headers.get("cf-ipcountry")
+        or headers.get("x-vercel-ip-country")
+        or headers.get("x-country-code")
+        or ""
+    ).strip()
+    return source_ip, country.upper() if country else _country_for_ip(source_ip)
+
+
 def _summarize_exception(exc: Exception) -> str:
     detail = str(exc).strip()
     if detail:
@@ -111,6 +151,7 @@ class ProviderRuntimeStats:
         self._texts_total = 0
         self._batches_total = 0
         self._batch_texts_total = 0
+        self._running_batch_texts = 0
         self._queue_depth = 0
         self._oldest_queue_age_seconds = 0.0
         self._reloads_total = 0
@@ -151,6 +192,10 @@ class ProviderRuntimeStats:
             self._batches_total += 1
             self._batch_texts_total += text_count
 
+    def set_running_batch(self, *, text_count: int) -> None:
+        with self._lock:
+            self._running_batch_texts = max(0, text_count)
+
     def update_pending(self, *, depth: int, oldest_age_seconds: float | None) -> None:
         with self._lock:
             self._queue_depth = max(0, depth)
@@ -173,6 +218,7 @@ class ProviderRuntimeStats:
                 "texts_total": self._texts_total,
                 "batches_total": self._batches_total,
                 "batch_texts_total": self._batch_texts_total,
+                "running_batch_texts": self._running_batch_texts,
                 "queue_depth": self._queue_depth,
                 "oldest_queue_age_seconds": self._oldest_queue_age_seconds,
                 "reloads_total": self._reloads_total,
@@ -186,6 +232,148 @@ class ProviderRuntimeStats:
                 "last_error_summary": self._last_error_summary,
                 "last_duration_ms": self._last_duration_ms,
             }
+
+
+class RequestLogBuffer:
+    def __init__(self, *, max_inputs: int = 10_000, max_requests: int = 10_000) -> None:
+        self._lock = threading.Lock()
+        self._inputs: deque[dict[str, Any]] = deque(maxlen=max_inputs)
+        self._requests: deque[dict[str, Any]] = deque(maxlen=max_requests)
+        self._request_index: dict[str, dict[str, Any]] = {}
+
+    def record_start(
+        self,
+        *,
+        request_id: str,
+        source_ip: str | None,
+        source_country: str,
+        model: str | None,
+        dimensions: int | None,
+        task: str | None,
+        texts: list[str],
+    ) -> None:
+        now_epoch = time.time()
+        now_iso = _utc_now_iso()
+        entry = {
+            "request_id": request_id,
+            "started_at": now_iso,
+            "started_epoch": now_epoch,
+            "source_ip": source_ip,
+            "source_country": source_country,
+            "model": model,
+            "dimensions": dimensions,
+            "task": task,
+            "text_count": len(texts),
+            "status": "running",
+            "status_code": None,
+            "duration_ms": None,
+            "error_summary": None,
+        }
+        input_entries = [
+            {
+                "request_id": request_id,
+                "input_index": idx,
+                "received_at": now_iso,
+                "source_ip": source_ip,
+                "source_country": source_country,
+                "model": model,
+                "dimensions": dimensions,
+                "task": task,
+                "input": text,
+            }
+            for idx, text in enumerate(texts)
+        ]
+        with self._lock:
+            self._requests.append(entry)
+            self._request_index[request_id] = entry
+            for item in input_entries:
+                self._inputs.append(item)
+            while len(self._request_index) > len(self._requests):
+                active_ids = {item["request_id"] for item in self._requests}
+                for old_id in list(self._request_index):
+                    if old_id not in active_ids:
+                        self._request_index.pop(old_id, None)
+
+    def record_finish(
+        self,
+        *,
+        request_id: str,
+        status_code: int,
+        duration_ms: float,
+        error_summary: str | None = None,
+    ) -> None:
+        with self._lock:
+            entry = self._request_index.get(request_id)
+            if entry is None:
+                return
+            entry["status"] = "ok" if status_code < 400 else "error"
+            entry["status_code"] = status_code
+            entry["duration_ms"] = round(duration_ms, 3)
+            entry["error_summary"] = error_summary
+
+    def recent_inputs(self, *, limit: int = 200) -> list[dict[str, Any]]:
+        safe_limit = max(1, min(10_000, int(limit)))
+        with self._lock:
+            return list(self._inputs)[-safe_limit:][::-1]
+
+    def recent_requests(self, *, limit: int = 200) -> list[dict[str, Any]]:
+        safe_limit = max(1, min(10_000, int(limit)))
+        with self._lock:
+            return [dict(item) for item in list(self._requests)[-safe_limit:][::-1]]
+
+    def qps_buckets(self, *, window_seconds: int = 3600, bucket_seconds: int = 30) -> list[dict[str, Any]]:
+        now = time.time()
+        window_start = now - max(1, window_seconds)
+        bucket_size = max(1, bucket_seconds)
+        bucket_count = max(1, math.ceil(window_seconds / bucket_size))
+        end_bucket = math.floor(now / bucket_size) * bucket_size
+        start_bucket = end_bucket - (bucket_count - 1) * bucket_size
+        buckets: list[dict[str, Any]] = []
+        for idx in range(bucket_count):
+            bucket_start = start_bucket + idx * bucket_size
+            buckets.append(
+                {
+                    "start_epoch": bucket_start,
+                    "start": datetime.fromtimestamp(bucket_start, timezone.utc).isoformat(),
+                    "requests": 0,
+                    "succeeded": 0,
+                    "failed": 0,
+                    "texts": 0,
+                    "qps": 0.0,
+                    "avg_duration_ms": None,
+                    "p95_duration_ms": None,
+                }
+            )
+        durations: list[list[float]] = [[] for _ in buckets]
+        with self._lock:
+            rows = [dict(item) for item in self._requests]
+        for row in rows:
+            started_epoch = float(row.get("started_epoch") or 0.0)
+            if started_epoch < window_start or started_epoch > now:
+                continue
+            index = int((started_epoch - start_bucket) // bucket_size)
+            if index < 0 or index >= len(buckets):
+                continue
+            bucket = buckets[index]
+            bucket["requests"] += 1
+            bucket["texts"] += int(row.get("text_count") or 0)
+            status_code = row.get("status_code")
+            if isinstance(status_code, int):
+                if status_code < 400:
+                    bucket["succeeded"] += 1
+                else:
+                    bucket["failed"] += 1
+            duration = row.get("duration_ms")
+            if isinstance(duration, (int, float)):
+                durations[index].append(float(duration))
+        for bucket, values in zip(buckets, durations):
+            bucket["qps"] = round(bucket["requests"] / bucket_size, 4)
+            if values:
+                values.sort()
+                bucket["avg_duration_ms"] = round(sum(values) / len(values), 3)
+                p95_index = min(len(values) - 1, math.ceil(len(values) * 0.95) - 1)
+                bucket["p95_duration_ms"] = round(values[p95_index], 3)
+        return buckets
 
 
 class AdaptiveBatchState:
@@ -486,6 +674,7 @@ class EmbedderRuntime:
                 "loaded_device": self.device_name,
                 "preferred_device": self._preferred_device,
                 "detected_device": self._detected_device,
+                "precision": self._settings.dtype,
                 "engine_state": self._engine_state,
                 "cuda_fallback_reason": self._cuda_fallback_reason,
                 "idle_offload_enabled": self._idle_offload_enabled,
@@ -982,6 +1171,7 @@ class ContinuousBatcher:
                 len(to_process), text_count, len(items) - len(to_process), task, dimensions,
             )
             self._stats.record_batch_dispatch(request_count=len(to_process), text_count=text_count)
+            self._stats.set_running_batch(text_count=text_count)
             fn = functools.partial(self._runtime.encode, all_texts, dimensions=dimensions, task=task)
             try:
                 embeddings: list[list[float]] = await loop.run_in_executor(None, fn)
@@ -992,6 +1182,7 @@ class ContinuousBatcher:
                     if not item.future.done():
                         item.future.set_exception(exc)
             finally:
+                self._stats.set_running_batch(text_count=0)
                 self._mark_processed(len(to_process))
 
         return overflow
@@ -1036,10 +1227,271 @@ def _require_api_key(settings: Settings, authorization: str | None) -> None:
         raise HTTPException(status_code=401, detail="Invalid or missing bearer token")
 
 
+def _dashboard_html() -> str:
+    return """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Embedding Provider Dashboard</title>
+  <style>
+    :root { color-scheme: dark; font-family: system-ui, sans-serif; background: #111; color: #eee; }
+    body { margin: 0; padding: 18px; }
+    header { display: flex; gap: 16px; align-items: baseline; margin-bottom: 14px; }
+    h1 { font-size: 20px; margin: 0; }
+    .muted { color: #aaa; font-size: 13px; }
+    .grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin-bottom: 14px; }
+    .card { border: 1px solid #333; border-radius: 6px; padding: 10px; background: #181818; }
+    .card[title] { cursor: help; }
+    .label { color: #aaa; font-size: 12px; }
+    .value { font-size: 18px; margin-top: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    qps-chart { display: block; height: 260px; margin-bottom: 14px; }
+    table { width: 100%; border-collapse: collapse; margin-top: 14px; table-layout: fixed; }
+    th, td { border-bottom: 1px solid #333; padding: 7px; text-align: left; vertical-align: top; font-size: 12px; }
+    th { color: #bbb; font-weight: 600; position: sticky; top: 0; background: #111; }
+    td { word-break: break-word; }
+    .input { white-space: pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .ok { color: #8fd18f; }
+    .error { color: #ff8a8a; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Embedding Provider</h1>
+    <div class="muted" id="updated">loading</div>
+  </header>
+  <section class="grid" id="cards"></section>
+  <qps-chart id="qps"></qps-chart>
+  <table>
+    <thead>
+      <tr>
+        <th style="width: 150px">time</th>
+        <th style="width: 110px">source</th>
+        <th style="width: 80px">country</th>
+        <th>input</th>
+      </tr>
+    </thead>
+    <tbody id="inputs"></tbody>
+  </table>
+<script>
+const cards = document.getElementById("cards");
+const updated = document.getElementById("updated");
+const qpsChart = document.getElementById("qps");
+const inputs = document.getElementById("inputs");
+
+function esc(value) {
+  return String(value ?? "").replace(/[&<>"']/g, ch => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+  }[ch]));
+}
+
+class QpsChart extends HTMLElement {
+  constructor() {
+    super();
+    this.attachShadow({ mode: "open" });
+    this.buckets = [];
+    this.hoverIndex = null;
+    this.shadowRoot.innerHTML = `
+      <style>
+        :host { position: relative; }
+        .frame {
+          position: relative; height: 100%; border: 1px solid #333; border-radius: 6px;
+          background: #151515; box-sizing: border-box; overflow: hidden;
+        }
+        .chart-head {
+          position: absolute; top: 10px; left: 14px; right: 14px; z-index: 1;
+          display: flex; justify-content: space-between; align-items: baseline;
+          color: #ddd; font: 600 13px system-ui;
+        }
+        .chart-head span { color: #999; font-weight: 400; font-size: 12px; }
+        svg { width: 100%; height: 100%; display: block; }
+        .axis { stroke: #444; stroke-width: 1; }
+        .grid { stroke: #292929; stroke-width: 1; }
+        .line { fill: none; stroke: #7cc7ff; stroke-width: 2.5; }
+        .area { fill: #7cc7ff; opacity: 0.14; }
+        .tick { fill: #9a9a9a; font: 11px system-ui; }
+        .crosshair { stroke: #777; stroke-width: 1; stroke-dasharray: 3 3; }
+        .dot { fill: #b8e1ff; stroke: #151515; stroke-width: 2; }
+        .tooltip {
+          position: absolute; min-width: 190px; pointer-events: none; display: none;
+          padding: 8px 10px; border: 1px solid #444; border-radius: 6px;
+          background: rgba(18, 18, 18, 0.96); box-shadow: 0 8px 24px rgba(0,0,0,0.35);
+          color: #eee; font: 12px system-ui; line-height: 1.45;
+        }
+        .tooltip strong { display: block; margin-bottom: 4px; color: #fff; font-size: 12px; }
+        .tooltip span { color: #aaa; }
+      </style>
+      <div class="frame">
+        <div class="chart-head">
+          <div>QPS trend</div>
+          <span>last 1h</span>
+        </div>
+        <svg></svg>
+        <div class="tooltip"></div>
+      </div>`;
+    this.svg = this.shadowRoot.querySelector("svg");
+    this.tooltip = this.shadowRoot.querySelector(".tooltip");
+    this.size = { width: 1000, height: 260 };
+    this.resizeObserver = new ResizeObserver(entries => {
+      const rect = entries[0]?.contentRect;
+      if (!rect) return;
+      this.size = { width: Math.max(320, rect.width), height: Math.max(220, rect.height) };
+      this.render();
+    });
+  }
+
+  connectedCallback() {
+    this.addEventListener("mousemove", event => this.onHover(event));
+    this.addEventListener("mouseleave", () => {
+      this.hoverIndex = null;
+      this.tooltip.style.display = "none";
+      this.render();
+    });
+    this.resizeObserver.observe(this);
+  }
+
+  disconnectedCallback() {
+    this.resizeObserver.disconnect();
+  }
+
+  setData(buckets) {
+    this.buckets = Array.isArray(buckets) ? buckets : [];
+    this.render();
+  }
+
+  pointFor(index, maxQps) {
+    const pad = { left: 58, right: 22, top: 44, bottom: 34 };
+    const width = this.size.width - pad.left - pad.right;
+    const height = this.size.height - pad.top - pad.bottom;
+    const bucket = this.buckets[index] || {};
+    const x = pad.left + (this.buckets.length <= 1 ? 0 : (index / (this.buckets.length - 1)) * width);
+    const y = pad.top + height - (((bucket.qps || 0) / maxQps) * height);
+    return { x, y };
+  }
+
+  render() {
+    const buckets = this.buckets;
+    const maxQps = Math.max(0.01, ...buckets.map(b => b.qps || 0));
+    const yTicks = [0, maxQps / 2, maxQps];
+    const pad = { left: 58, right: 22, top: 44, bottom: 34 };
+    const width = this.size.width - pad.left - pad.right;
+    const height = this.size.height - pad.top - pad.bottom;
+    const points = buckets.map((_, index) => this.pointFor(index, maxQps));
+    const line = points.map((p, index) => `${index === 0 ? "M" : "L"} ${p.x.toFixed(1)} ${p.y.toFixed(1)}`).join(" ");
+    const area = points.length
+      ? `${line} L ${points[points.length - 1].x.toFixed(1)} ${pad.top + height} L ${pad.left} ${pad.top + height} Z`
+      : "";
+    const hover = this.hoverIndex === null ? null : points[this.hoverIndex];
+    const start = buckets[0]?.start_epoch ? new Date(buckets[0].start_epoch * 1000) : null;
+    const end = buckets[buckets.length - 1]?.start_epoch ? new Date(buckets[buckets.length - 1].start_epoch * 1000) : null;
+    this.svg.setAttribute("viewBox", `0 0 ${this.size.width} ${this.size.height}`);
+
+    this.svg.innerHTML = `
+      ${yTicks.map(value => {
+        const y = pad.top + height - (value / maxQps) * height;
+        return `<line class="grid" x1="${pad.left}" y1="${y}" x2="${pad.left + width}" y2="${y}"></line>
+          <text class="tick" x="12" y="${y + 4}">${value.toFixed(3)}</text>`;
+      }).join("")}
+      <line class="axis" x1="${pad.left}" y1="${pad.top}" x2="${pad.left}" y2="${pad.top + height}"></line>
+      <line class="axis" x1="${pad.left}" y1="${pad.top + height}" x2="${pad.left + width}" y2="${pad.top + height}"></line>
+      ${start ? `<text class="tick" x="${pad.left}" y="${this.size.height - 10}">${start.toLocaleTimeString()}</text>` : ""}
+      ${end ? `<text class="tick" x="${pad.left + width - 72}" y="${this.size.height - 10}">${end.toLocaleTimeString()}</text>` : ""}
+      ${area ? `<path class="area" d="${area}"></path><path class="line" d="${line}"></path>` : ""}
+      ${hover ? `<line class="crosshair" x1="${hover.x}" y1="${pad.top}" x2="${hover.x}" y2="${pad.top + height}"></line>
+        <circle class="dot" cx="${hover.x}" cy="${hover.y}" r="4"></circle>` : ""}
+    `;
+  }
+
+  onHover(event) {
+    if (!this.buckets.length) return;
+    const rect = this.getBoundingClientRect();
+    const x = event.clientX - rect.left;
+    const padLeft = 58;
+    const chartWidth = this.size.width - 58 - 22;
+    const ratio = Math.max(0, Math.min(1, (x - padLeft) / chartWidth));
+    const index = Math.round(ratio * (this.buckets.length - 1));
+    this.hoverIndex = index;
+    this.render();
+
+    const bucket = this.buckets[index];
+    const time = new Date(bucket.start_epoch * 1000).toLocaleString();
+    this.tooltip.innerHTML = `
+      <strong>${esc(time)}</strong>
+      <div><span>QPS</span> ${Number(bucket.qps || 0).toFixed(4)}</div>
+      <div><span>requests</span> ${esc(bucket.requests)}</div>
+      <div><span>texts</span> ${esc(bucket.texts)}</div>
+      <div><span>failed</span> ${esc(bucket.failed)}</div>
+      <div><span>p95</span> ${bucket.p95_duration_ms ?? "-"} ms</div>
+    `;
+    this.tooltip.style.display = "block";
+    const left = Math.min(rect.width - 220, Math.max(8, event.clientX - rect.left + 12));
+    this.tooltip.style.left = `${left}px`;
+    this.tooltip.style.top = "42px";
+  }
+}
+
+customElements.define("qps-chart", QpsChart);
+
+async function apiJson(url) {
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+  return response.json();
+}
+
+async function refresh() {
+  const [stats, metrics, log] = await Promise.all([
+    apiJson("/statsz"),
+    apiJson("/metricsz?window_seconds=3600&bucket_seconds=30"),
+    apiJson("/request-logz?limit=200")
+  ]);
+  const s = stats.stats;
+  const r = stats.runtime;
+  const lastError = s.last_error_summary
+    ? `${s.last_error_at ?? ""} ${s.last_error_request_id ?? ""}\n${s.last_error_summary}`
+    : "no recorded errors";
+  const cardRows = [
+    { label: "requests", value: s.requests_total },
+    { label: "inflight / queue", value: `${r.inflight_encodes} / ${s.queue_depth}` },
+    { label: "device", value: r.loaded_device },
+    { label: "precision", value: r.precision ?? "-" },
+    { label: "worker pid", value: r.worker_pid ?? "-" },
+    {
+      label: "batch size / batch target",
+      value: `${r.adaptive_batch?.last_batch_texts ?? "-"} / ${r.adaptive_batch?.current_target ?? "-"}`
+    },
+    { label: "last duration", value: `${s.last_duration_ms ?? "-"} ms` },
+    { label: "errors", value: s.requests_failed, title: lastError }
+  ];
+  cards.innerHTML = cardRows.map(item => `
+    <div class="card"${item.title ? ` title="${esc(item.title)}"` : ""}>
+      <div class="label">${esc(item.label)}</div>
+      <div class="value">${esc(item.value)}</div>
+    </div>
+  `).join("");
+  qpsChart.setData(metrics.buckets);
+  inputs.innerHTML = log.inputs.map(item => `
+    <tr>
+      <td>${esc(item.received_at)}</td>
+      <td>${esc(item.source_ip)}</td>
+      <td>${esc(item.source_country)}</td>
+      <td class="input">${esc(item.input)}</td>
+    </tr>
+  `).join("");
+  updated.textContent = `updated ${new Date().toLocaleTimeString()}`;
+}
+
+refresh();
+setInterval(refresh, 3000);
+</script>
+</body>
+</html>"""
+
+
 def create_app(settings: Settings | None = None, runtime: EmbedderRuntime | None = None) -> FastAPI:
     resolved_settings = settings or Settings.from_env()
     resolved_runtime = runtime or EmbedderRuntime(resolved_settings)
     stats = ProviderRuntimeStats()
+    request_log = RequestLogBuffer(max_inputs=10_000, max_requests=10_000)
     resolved_runtime.attach_stats(stats)
     batcher = ContinuousBatcher(resolved_runtime, stats=stats, window_secs=resolved_settings.batch_window_ms / 1000)
 
@@ -1107,6 +1559,37 @@ def create_app(settings: Settings | None = None, runtime: EmbedderRuntime | None
             "runtime": resolved_runtime.runtime_status(),
         }
 
+    @app.get("/metricsz")
+    def metricsz(
+        window_seconds: int = 3600,
+        bucket_seconds: int = 30,
+    ) -> dict[str, Any]:
+        return {
+            "service": resolved_settings.service_name,
+            "model": resolved_settings.model_id,
+            "window_seconds": window_seconds,
+            "bucket_seconds": bucket_seconds,
+            "buckets": request_log.qps_buckets(
+                window_seconds=max(1, min(86_400, window_seconds)),
+                bucket_seconds=max(1, min(3600, bucket_seconds)),
+            ),
+            "stats": stats.snapshot(),
+            "runtime": resolved_runtime.runtime_status(),
+        }
+
+    @app.get("/request-logz")
+    def request_logz(limit: int = 200) -> dict[str, Any]:
+        return {
+            "service": resolved_settings.service_name,
+            "model": resolved_settings.model_id,
+            "inputs": request_log.recent_inputs(limit=limit),
+            "requests": request_log.recent_requests(limit=limit),
+        }
+
+    @app.get("/dashboard", response_class=HTMLResponse)
+    def dashboard() -> HTMLResponse:
+        return HTMLResponse(_dashboard_html())
+
     @app.get("/v1/models", response_model=ModelList)
     def list_models(authorization: str | None = Header(default=None)) -> ModelList:
         _require_api_key(resolved_settings, authorization)
@@ -1114,6 +1597,7 @@ def create_app(settings: Settings | None = None, runtime: EmbedderRuntime | None
 
     @app.post("/v1/embeddings", response_model=EmbeddingResponse)
     async def create_embeddings(
+        http_request: Request,
         request: EmbeddingRequest,
         response: Response,
         authorization: str | None = Header(default=None),
@@ -1138,6 +1622,16 @@ def create_app(settings: Settings | None = None, runtime: EmbedderRuntime | None
                 headers={"X-Request-Id": request_id},
             )
         texts = _validate_inputs(request.input)
+        source_ip, source_country = _client_ip_and_country(http_request)
+        request_log.record_start(
+            request_id=request_id,
+            source_ip=source_ip,
+            source_country=source_country,
+            model=request.model,
+            dimensions=request.dimensions,
+            task=request.task,
+            texts=texts,
+        )
         stats.record_request_start(request_id=request_id, text_count=len(texts))
         started_at = time.perf_counter()
         log.info(
@@ -1162,6 +1656,12 @@ def create_app(settings: Settings | None = None, runtime: EmbedderRuntime | None
                 duration_ms=duration_ms,
                 error_summary=error_summary,
             )
+            request_log.record_finish(
+                request_id=request_id,
+                status_code=400,
+                duration_ms=duration_ms,
+                error_summary=error_summary,
+            )
             log.warning(
                 "embedding request failed request_id=%s texts=%d duration_ms=%.1f error=%s",
                 request_id,
@@ -1175,6 +1675,12 @@ def create_app(settings: Settings | None = None, runtime: EmbedderRuntime | None
             error_summary = _summarize_exception(exc)
             stats.record_request_failure(
                 request_id=request_id,
+                duration_ms=duration_ms,
+                error_summary=error_summary,
+            )
+            request_log.record_finish(
+                request_id=request_id,
+                status_code=500,
                 duration_ms=duration_ms,
                 error_summary=error_summary,
             )
@@ -1193,6 +1699,11 @@ def create_app(settings: Settings | None = None, runtime: EmbedderRuntime | None
 
         duration_ms = (time.perf_counter() - started_at) * 1000
         stats.record_request_success(request_id=request_id, duration_ms=duration_ms)
+        request_log.record_finish(
+            request_id=request_id,
+            status_code=200,
+            duration_ms=duration_ms,
+        )
         log.info(
             "embedding request succeeded request_id=%s texts=%d duration_ms=%.1f",
             request_id,

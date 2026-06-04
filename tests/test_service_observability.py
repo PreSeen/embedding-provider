@@ -73,7 +73,7 @@ if "transformers" not in sys.modules:
     fake_transformers.AutoModel = _FakeAutoModel
     sys.modules["transformers"] = fake_transformers
 
-from provider.app import AdaptiveBatchState, create_app
+from provider.app import AdaptiveBatchState, RequestLogBuffer, _country_for_ip, create_app
 from provider.config import Settings
 
 
@@ -250,3 +250,48 @@ def test_adaptive_batch_state_respects_request_shrink_and_reset() -> None:
     state.reset()
     assert state.current_target == 1
     assert state.snapshot()["last_batch_texts"] == 0
+
+
+def test_request_log_buffer_keeps_recent_inputs_and_qps_buckets() -> None:
+    log = RequestLogBuffer(max_inputs=3, max_requests=10)
+    log.record_start(
+        request_id="req-1",
+        source_ip="127.0.0.1",
+        source_country="localhost",
+        model="model-a",
+        dimensions=4,
+        task="search",
+        texts=["alpha", "beta"],
+    )
+    log.record_finish(request_id="req-1", status_code=200, duration_ms=12.34)
+    log.record_start(
+        request_id="req-2",
+        source_ip="127.0.0.2",
+        source_country="localhost",
+        model="model-a",
+        dimensions=4,
+        task="search",
+        texts=["gamma", "delta"],
+    )
+    log.record_finish(request_id="req-2", status_code=500, duration_ms=56.78, error_summary="boom")
+
+    inputs = log.recent_inputs(limit=10)
+    assert [item["input"] for item in inputs] == ["delta", "gamma", "beta"]
+    assert inputs[0]["request_id"] == "req-2"
+    assert inputs[0]["source_country"] == "localhost"
+
+    requests = log.recent_requests(limit=10)
+    assert requests[0]["status"] == "error"
+    assert requests[0]["error_summary"] == "boom"
+    assert requests[1]["status"] == "ok"
+
+    buckets = log.qps_buckets(window_seconds=3600, bucket_seconds=30)
+    assert sum(bucket["requests"] for bucket in buckets) == 2
+    assert sum(bucket["texts"] for bucket in buckets) == 4
+    assert sum(bucket["failed"] for bucket in buckets) == 1
+
+
+def test_country_for_ip_identifies_local_networks() -> None:
+    assert _country_for_ip("127.0.0.1") == "localhost"
+    assert _country_for_ip("192.168.1.10") == "LAN"
+    assert _country_for_ip("not-an-ip") == "unknown"
