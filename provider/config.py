@@ -36,6 +36,8 @@ class Settings:
     idle_offload_seconds: float
     idle_offload_poll_seconds: float
     cpu_to_gpu_scale_up_texts: int
+    gpu_to_cpu_scale_down_texts: int
+    gpu_to_cpu_scale_down_seconds: float
     start_device: str
     cuda_visible_devices: str | None
 
@@ -58,6 +60,8 @@ class Settings:
             idle_offload_seconds=float(os.getenv("IDLE_OFFLOAD_SECONDS", "1800")),
             idle_offload_poll_seconds=float(os.getenv("IDLE_OFFLOAD_POLL_SECONDS", "30")),
             cpu_to_gpu_scale_up_texts=_env_int("CPU_TO_GPU_SCALE_UP_TEXTS", "8") or 0,
+            gpu_to_cpu_scale_down_texts=_env_int("GPU_TO_CPU_SCALE_DOWN_TEXTS", "2") or 0,
+            gpu_to_cpu_scale_down_seconds=float(os.getenv("GPU_TO_CPU_SCALE_DOWN_SECONDS", "30")),
             start_device=os.getenv("START_DEVICE", "auto").strip().lower(),
             cuda_visible_devices=os.getenv("CUDA_VISIBLE_DEVICES") or None,
         )

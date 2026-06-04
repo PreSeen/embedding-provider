@@ -135,6 +135,8 @@ def _settings() -> Settings:
         idle_offload_seconds=0,
         idle_offload_poll_seconds=0,
         cpu_to_gpu_scale_up_texts=8,
+        gpu_to_cpu_scale_down_texts=2,
+        gpu_to_cpu_scale_down_seconds=30,
         start_device="auto",
         cuda_visible_devices=None,
     )

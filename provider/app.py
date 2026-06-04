@@ -623,6 +623,7 @@ class EmbedderRuntime:
         self._inflight_encodes = 0
         self._last_encode_finished_at = time.monotonic()
         self._last_offloaded_at: float | None = None
+        self._gpu_low_batch_since: float | None = None
         self._idle_offload_enabled = self._detected_device == "cuda" and settings.idle_offload_seconds > 0
         self._stats: ProviderRuntimeStats | None = None
         self._cuda_fallback_reason: str | None = None
@@ -696,6 +697,12 @@ class EmbedderRuntime:
                     self._settings.idle_offload_poll_seconds if self._idle_offload_enabled else None
                 ),
                 "cpu_to_gpu_scale_up_texts": self._settings.cpu_to_gpu_scale_up_texts,
+                "gpu_to_cpu_scale_down_texts": self._settings.gpu_to_cpu_scale_down_texts,
+                "gpu_to_cpu_scale_down_seconds": self._settings.gpu_to_cpu_scale_down_seconds,
+                "gpu_low_batch_seconds": (
+                    round(max(0.0, time.monotonic() - self._gpu_low_batch_since), 3)
+                    if self._gpu_low_batch_since is not None else None
+                ),
                 "inflight_encodes": self._inflight_encodes,
                 "idle_for_seconds": round(idle_for, 3),
                 "offloaded_for_seconds": round(offloaded_for, 3) if offloaded_for is not None else None,
@@ -714,8 +721,24 @@ class EmbedderRuntime:
         with self._model_lock:
             if self._reload_in_progress or self.device_name == "cpu" or self._inflight_encodes > 0:
                 return False
-            idle_for = time.monotonic() - self._last_encode_finished_at
-            if idle_for < self._settings.idle_offload_seconds:
+            low_batch_since = self._gpu_low_batch_since
+            should_offload = False
+            if (
+                low_batch_since is not None
+                and self._settings.gpu_to_cpu_scale_down_texts > 0
+                and self._settings.gpu_to_cpu_scale_down_seconds >= 0
+            ):
+                low_for = time.monotonic() - low_batch_since
+                if low_for >= self._settings.gpu_to_cpu_scale_down_seconds:
+                    log.info(
+                        "GPU stayed below scale-down threshold for %.1fs without new requests; switching to CPU",
+                        low_for,
+                    )
+                    should_offload = True
+            if not should_offload:
+                idle_for = time.monotonic() - self._last_encode_finished_at
+                should_offload = idle_for >= self._settings.idle_offload_seconds
+            if not should_offload:
                 return False
         self._switch_to_cpu(mark_offload=True)
         return True
@@ -802,6 +825,8 @@ class EmbedderRuntime:
                 del old_model
                 gc.collect()
             self.adaptive_batch.reset()
+            with self._model_lock:
+                self._gpu_low_batch_since = None
             if self._stats is not None:
                 if mark_offload:
                     self._stats.record_offload()
@@ -842,6 +867,7 @@ class EmbedderRuntime:
                 self.device_name = device_name
                 self._engine_state = "hot"
                 self._last_offloaded_at = None
+                self._gpu_low_batch_since = None
             if old_model is not None:
                 del old_model
                 gc.collect()
@@ -1028,6 +1054,7 @@ class EmbedderRuntime:
 
     def encode(self, texts: list[str], *, dimensions: int | None = None, task: str | None = None) -> list[list[float]]:
         self._begin_encode(len(texts))
+        succeeded = False
         try:
             embeddings: list[list[float]] = []
             offset = 0
@@ -1058,9 +1085,46 @@ class EmbedderRuntime:
                 )
                 if shrank:
                     self._release_cuda_cache()
+            succeeded = True
             return embeddings
         finally:
             self._finish_encode()
+            if succeeded:
+                self._maybe_scale_down_for_request(len(texts))
+
+    def _maybe_scale_down_for_request(self, text_count: int) -> None:
+        if (
+            self._settings.gpu_to_cpu_scale_down_texts <= 0
+            or self._settings.gpu_to_cpu_scale_down_seconds < 0
+            or self._detected_device != "cuda"
+            or self._preferred_device != "cuda"
+            or not self._use_gpu_worker
+        ):
+            return
+
+        now = time.monotonic()
+        with self._model_lock:
+            if text_count >= self._settings.gpu_to_cpu_scale_down_texts:
+                self._gpu_low_batch_since = None
+                return
+            if self._gpu_low_batch_since is None:
+                self._gpu_low_batch_since = now
+                return
+            low_for = now - self._gpu_low_batch_since
+            if (
+                low_for < self._settings.gpu_to_cpu_scale_down_seconds
+                or self._reload_in_progress
+                or self._inflight_encodes > 0
+            ):
+                return
+
+        log.info(
+            "GPU batch stayed below scale-down threshold: texts=%d threshold=%d seconds=%.1f; switching to CPU",
+            text_count,
+            self._settings.gpu_to_cpu_scale_down_texts,
+            low_for,
+        )
+        self._switch_to_cpu(mark_offload=True)
 
     def estimate_max_texts(self) -> int:
         vram_cap = self._estimate_vram_text_cap()

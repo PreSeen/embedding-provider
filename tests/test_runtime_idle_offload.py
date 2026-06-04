@@ -140,6 +140,8 @@ class EmbedderRuntimeIdleOffloadTests(unittest.TestCase):
             "IDLE_OFFLOAD_SECONDS": "1",
             "IDLE_OFFLOAD_POLL_SECONDS": "1",
             "CPU_TO_GPU_SCALE_UP_TEXTS": "3",
+            "GPU_TO_CPU_SCALE_DOWN_TEXTS": "2",
+            "GPU_TO_CPU_SCALE_DOWN_SECONDS": "30",
             "NORMALIZE_EMBEDDINGS": "true",
             "DTYPE": "float32",
             "TRUST_REMOTE_CODE": "true",
@@ -200,6 +202,44 @@ class EmbedderRuntimeIdleOffloadTests(unittest.TestCase):
         self.assertGreaterEqual(workers[0].stops, 1)
         self.assertGreaterEqual(workers[1].starts, 1)
 
+    def test_low_batch_scale_down_runs_without_follow_up_request(self) -> None:
+        workers: list[FakeWorker] = []
+
+        def fake_worker_factory(settings: Settings) -> FakeWorker:
+            worker = FakeWorker(settings)
+            workers.append(worker)
+            return worker
+
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "IDLE_OFFLOAD_SECONDS": "999",
+                    "GPU_TO_CPU_SCALE_DOWN_SECONDS": "1",
+                },
+            ),
+            patch("provider.app._GpuEmbedderWorker", side_effect=fake_worker_factory),
+            patch("provider.app._detect_preferred_device", return_value="cuda"),
+            patch("provider.app._probe_cuda_memory_bytes", return_value=(8 * 1024**3, 24 * 1024**3)),
+        ):
+            runtime = EmbedderRuntime(Settings.from_env())
+            try:
+                runtime.encode(["one", "two", "three"])
+                self.assertEqual(runtime.runtime_status()["loaded_device"], "cuda")
+
+                runtime.encode(["small"])
+                status = runtime.runtime_status()
+                self.assertEqual(status["loaded_device"], "cuda")
+                self.assertIsNotNone(status["gpu_low_batch_seconds"])
+
+                runtime._gpu_low_batch_since -= 2
+                offloaded = runtime.maybe_offload_idle()
+                self.assertTrue(offloaded)
+                self.assertEqual(runtime.runtime_status()["loaded_device"], "cpu")
+                self.assertEqual(runtime.runtime_status()["effective_batch_target"], 8)
+            finally:
+                runtime.close()
+
     def test_estimate_max_texts_drops_to_one_when_free_vram_is_below_safety_margin(self) -> None:
         with (
             patch("provider.app._GpuEmbedderWorker", FakeWorker),
@@ -235,6 +275,35 @@ class EmbedderRuntimeIdleOffloadTests(unittest.TestCase):
                 self.assertEqual(status["loaded_device"], "cpu")
                 self.assertEqual(status["preferred_device"], "cpu")
                 self.assertIsNone(status["worker_pid"])
+            finally:
+                runtime.close()
+
+    def test_runtime_scales_down_from_gpu_after_sustained_small_batches(self) -> None:
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "START_DEVICE": "cpu",
+                    "CPU_TO_GPU_SCALE_UP_TEXTS": "3",
+                    "GPU_TO_CPU_SCALE_DOWN_TEXTS": "2",
+                    "GPU_TO_CPU_SCALE_DOWN_SECONDS": "0",
+                },
+            ),
+            patch("provider.app._GpuEmbedderWorker", FakeWorker),
+            patch("provider.app._detect_preferred_device", return_value="cuda"),
+            patch("provider.app._probe_cuda_memory_bytes", return_value=(8 * 1024**3, 24 * 1024**3)),
+        ):
+            runtime = EmbedderRuntime(Settings.from_env())
+            try:
+                runtime.switch_device("cuda")
+                self.assertEqual(runtime.runtime_status()["loaded_device"], "cuda")
+
+                runtime.encode(["small-one"])
+                self.assertEqual(runtime.runtime_status()["loaded_device"], "cuda")
+
+                runtime.encode(["small-two"])
+                self.assertEqual(runtime.runtime_status()["loaded_device"], "cpu")
+                self.assertIsNone(runtime.runtime_status()["worker_pid"])
             finally:
                 runtime.close()
 

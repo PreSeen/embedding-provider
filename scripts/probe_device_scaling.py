@@ -145,6 +145,8 @@ async def main_async() -> int:
     parser.add_argument("--low-requests", type=int, default=3)
     parser.add_argument("--low-interval", type=float, default=0.25)
     parser.add_argument("--burst-requests", type=int, default=8)
+    parser.add_argument("--scale-down-timeout", type=float, default=60.0)
+    parser.add_argument("--scale-down-interval", type=float, default=1.0)
     parser.add_argument("--timeout", type=float, default=60.0)
     parser.add_argument("--skip-manual-reset", action="store_true")
     args = parser.parse_args()
@@ -188,10 +190,29 @@ async def main_async() -> int:
     results.append(PhaseResult("burst_gpu_scale_up", before_burst, after_burst, burst_latencies))
 
     before_down = after_burst
-    after_down = _switch_device(args.base_url, api_key, "cpu")
-    _require(_device(after_down) == "cpu", f"scale-down phase should return to CPU, got {_device(after_down)}")
+    down_latencies: list[float] = []
+    deadline = time.monotonic() + args.scale_down_timeout
+    after_down = after_burst
+    attempt = 0
+    while time.monotonic() < deadline:
+        down_latencies.append(
+            await _post_embedding(
+                args.base_url,
+                api_key,
+                model,
+                [f"scale-down-low-batch-{attempt}"],
+                args.timeout,
+            )
+        )
+        after_down = _runtime(args.base_url)
+        if _device(after_down) == "cpu":
+            break
+        attempt += 1
+        await asyncio.sleep(args.scale_down_interval)
+
+    _require(_device(after_down) == "cpu", f"automatic scale-down phase should return to CPU, got {_device(after_down)}")
     _require(after_down.get("worker_pid") is None, "CPU scale-down should clear worker_pid")
-    results.append(PhaseResult("manual_gpu_scale_down", before_down, after_down, []))
+    results.append(PhaseResult("automatic_gpu_scale_down", before_down, after_down, down_latencies))
 
     print("device scaling probe passed")
     for item in results:
