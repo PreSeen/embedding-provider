@@ -139,6 +139,7 @@ class EmbedderRuntimeIdleOffloadTests(unittest.TestCase):
             "BATCH_WINDOW_MS": "200",
             "IDLE_OFFLOAD_SECONDS": "1",
             "IDLE_OFFLOAD_POLL_SECONDS": "1",
+            "CPU_TO_GPU_SCALE_UP_TEXTS": "3",
             "NORMALIZE_EMBEDDINGS": "true",
             "DTYPE": "float32",
             "TRUST_REMOTE_CODE": "true",
@@ -184,6 +185,11 @@ class EmbedderRuntimeIdleOffloadTests(unittest.TestCase):
 
             embeddings = runtime.encode(["hello world", "again"])
             self.assertEqual(len(embeddings), 2)
+            self.assertEqual(runtime.runtime_status()["loaded_device"], "cpu")
+            self.assertEqual(runtime.runtime_status()["preferred_device"], "cpu")
+
+            embeddings = runtime.encode(["hello world", "again", "third"])
+            self.assertEqual(len(embeddings), 3)
             self.assertEqual(runtime.runtime_status()["loaded_device"], "cuda")
             self.assertEqual(runtime.runtime_status()["preferred_device"], "cuda")
             self.assertEqual(runtime.runtime_status()["engine_state"], "hot")
@@ -203,6 +209,32 @@ class EmbedderRuntimeIdleOffloadTests(unittest.TestCase):
             runtime = EmbedderRuntime(Settings.from_env())
             try:
                 self.assertEqual(runtime.estimate_max_texts(), 1)
+            finally:
+                runtime.close()
+
+    def test_runtime_can_start_on_cpu_and_switch_devices_without_restart(self) -> None:
+        with (
+            patch.dict(os.environ, {"START_DEVICE": "cpu"}),
+            patch("provider.app._GpuEmbedderWorker", FakeWorker),
+            patch("provider.app._detect_preferred_device", return_value="cuda"),
+            patch("provider.app._probe_cuda_memory_bytes", return_value=(8 * 1024**3, 24 * 1024**3)),
+        ):
+            runtime = EmbedderRuntime(Settings.from_env())
+            try:
+                status = runtime.runtime_status()
+                self.assertEqual(status["loaded_device"], "cpu")
+                self.assertEqual(status["detected_device"], "cuda")
+                self.assertIsNone(status["worker_pid"])
+
+                status = runtime.switch_device("cuda")
+                self.assertEqual(status["loaded_device"], "cuda")
+                self.assertEqual(status["preferred_device"], "cuda")
+                self.assertIsNotNone(status["worker_pid"])
+
+                status = runtime.switch_device("cpu")
+                self.assertEqual(status["loaded_device"], "cpu")
+                self.assertEqual(status["preferred_device"], "cpu")
+                self.assertIsNone(status["worker_pid"])
             finally:
                 runtime.close()
 

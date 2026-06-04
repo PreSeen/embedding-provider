@@ -134,6 +134,9 @@ def _settings() -> Settings:
         batch_window_ms=1,
         idle_offload_seconds=0,
         idle_offload_poll_seconds=0,
+        cpu_to_gpu_scale_up_texts=8,
+        start_device="auto",
+        cuda_visible_devices=None,
     )
 
 

@@ -34,9 +34,6 @@ logging.basicConfig(level="INFO")
 _CUDA_VRAM_SAFETY_FIXED_BYTES = 512 * 1024 * 1024
 _CUDA_VRAM_SAFETY_TOTAL_RATIO = 0.05
 _CUDA_BATCH_GROWTH_FACTOR = 2
-_CPU_TO_GPU_SCALE_UP_TEXTS = 2
-
-
 def _batched(values: list[str], batch_size: int) -> list[list[str]]:
     if batch_size <= 0:
         return [values]
@@ -88,6 +85,9 @@ def _probe_cuda_memory_bytes() -> tuple[int | None, int | None]:
 
 
 def _detect_preferred_device() -> str:
+    visible_devices = os.getenv("CUDA_VISIBLE_DEVICES")
+    if visible_devices is not None and visible_devices.strip().lower() in {"", "-1", "none", "cpu"}:
+        return "cpu"
     free_bytes, _total_bytes = _probe_cuda_memory_bytes()
     return "cuda" if free_bytes is not None else "cpu"
 
@@ -474,6 +474,10 @@ class EmbeddingResponse(BaseModel):
     usage: EmbeddingUsage = Field(default_factory=EmbeddingUsage)
 
 
+class DeviceSwitchRequest(BaseModel):
+    device: Literal["cpu", "cuda"]
+
+
 class ModelInfo(BaseModel):
     id: str
     object: Literal["model"] = "model"
@@ -508,6 +512,9 @@ class _GpuEmbedderWorker:
                 return self._device_name
             env = os.environ.copy()
             env["PYTHONUNBUFFERED"] = "1"
+            env["START_DEVICE"] = "cuda"
+            if self._settings.cuda_visible_devices:
+                env["CUDA_VISIBLE_DEVICES"] = self._settings.cuda_visible_devices
             self._process = subprocess.Popen(
                 [sys.executable, "-m", "provider.gpu_worker"],
                 cwd=str(self._root_dir),
@@ -595,7 +602,12 @@ class EmbedderRuntime:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
         self._detected_device = _detect_preferred_device()
-        self._preferred_device = self._detected_device
+        if settings.start_device == "cpu":
+            self._preferred_device = "cpu"
+        elif settings.start_device == "cuda" and self._detected_device == "cuda":
+            self._preferred_device = "cuda"
+        else:
+            self._preferred_device = self._detected_device
         self._device = self._preferred_device
         self.device_name = "none" if self._preferred_device == "cuda" else self._device
         self._model_lock = threading.Condition()
@@ -675,6 +687,7 @@ class EmbedderRuntime:
                 "preferred_device": self._preferred_device,
                 "detected_device": self._detected_device,
                 "precision": self._settings.dtype,
+                "start_device": self._settings.start_device,
                 "engine_state": self._engine_state,
                 "cuda_fallback_reason": self._cuda_fallback_reason,
                 "idle_offload_enabled": self._idle_offload_enabled,
@@ -682,6 +695,7 @@ class EmbedderRuntime:
                 "idle_offload_poll_seconds": (
                     self._settings.idle_offload_poll_seconds if self._idle_offload_enabled else None
                 ),
+                "cpu_to_gpu_scale_up_texts": self._settings.cpu_to_gpu_scale_up_texts,
                 "inflight_encodes": self._inflight_encodes,
                 "idle_for_seconds": round(idle_for, 3),
                 "offloaded_for_seconds": round(offloaded_for, 3) if offloaded_for is not None else None,
@@ -703,36 +717,8 @@ class EmbedderRuntime:
             idle_for = time.monotonic() - self._last_encode_finished_at
             if idle_for < self._settings.idle_offload_seconds:
                 return False
-            self._reload_in_progress = True
-        try:
-            if self._use_gpu_worker:
-                if self._gpu_worker is not None:
-                    self._gpu_worker.terminate()
-                self.adaptive_batch.reset()
-                next_model = self._load_model(device_override="cpu")
-                with self._model_lock:
-                    self._use_gpu_worker = False
-                    self._preferred_device = "cpu"
-                    self._device = "cpu"
-                    self.device_name = "cpu"
-                    self._model = next_model
-                    self._encode_signature = inspect.signature(self._model.encode)
-                    self._engine_state = "hot"
-                    self._last_offloaded_at = time.monotonic()
-            else:
-                next_model = self._load_model(device_override="cpu")
-                self._swap_model(next_model, "cpu", engine_state="hot")
-                with self._model_lock:
-                    self._preferred_device = "cpu"
-                    self._last_offloaded_at = time.monotonic()
-                self.adaptive_batch.reset()
-            if self._stats is not None:
-                self._stats.record_offload()
-            return True
-        finally:
-            with self._model_lock:
-                self._reload_in_progress = False
-                self._model_lock.notify_all()
+        self._switch_to_cpu(mark_offload=True)
+        return True
 
     def _ensure_hot_model(self) -> None:
         if not self._idle_offload_enabled:
@@ -769,13 +755,70 @@ class EmbedderRuntime:
 
     def _maybe_scale_up_for_request(self, text_count: int) -> None:
         if (
-            text_count < _CPU_TO_GPU_SCALE_UP_TEXTS
+            self._settings.cpu_to_gpu_scale_up_texts <= 0
+            or text_count < self._settings.cpu_to_gpu_scale_up_texts
             or self._detected_device != "cuda"
             or self._cuda_fallback_reason is not None
         ):
             return
+        self._switch_to_cuda(wait_for_idle=False)
+
+    def switch_device(self, target_device: str) -> dict[str, Any]:
+        if target_device == "cpu":
+            self._switch_to_cpu(mark_offload=False)
+            return self.runtime_status()
+        if target_device == "cuda":
+            self._switch_to_cuda(wait_for_idle=True)
+            return self.runtime_status()
+        raise ValueError(f"unsupported device: {target_device}")
+
+    def _switch_to_cpu(self, *, mark_offload: bool) -> None:
         with self._model_lock:
-            while self._reload_in_progress:
+            while self._reload_in_progress or self._inflight_encodes > 0:
+                self._model_lock.wait()
+            if self.device_name == "cpu" and not self._use_gpu_worker:
+                return
+            self._reload_in_progress = True
+        try:
+            old_model = None
+            if self._use_gpu_worker:
+                if self._gpu_worker is not None:
+                    self._gpu_worker.terminate()
+                self._gpu_worker = None
+            else:
+                old_model = self._model
+
+            next_model = self._load_model(device_override="cpu")
+            with self._model_lock:
+                self._model = next_model
+                self._encode_signature = inspect.signature(self._model.encode)
+                self._use_gpu_worker = False
+                self._preferred_device = "cpu"
+                self._device = "cpu"
+                self.device_name = "cpu"
+                self._engine_state = "hot"
+                self._last_offloaded_at = time.monotonic() if mark_offload else None
+            if old_model is not None:
+                del old_model
+                gc.collect()
+            self.adaptive_batch.reset()
+            if self._stats is not None:
+                if mark_offload:
+                    self._stats.record_offload()
+                else:
+                    self._stats.record_reload()
+        finally:
+            with self._model_lock:
+                self._reload_in_progress = False
+                self._model_lock.notify_all()
+
+    def _switch_to_cuda(self, *, wait_for_idle: bool) -> None:
+        if self._detected_device != "cuda":
+            raise RuntimeError("CUDA is not available for this runtime")
+        if self._cuda_fallback_reason is not None:
+            raise RuntimeError(f"CUDA fallback is active: {self._cuda_fallback_reason}")
+        with self._model_lock:
+            while self._reload_in_progress or (wait_for_idle and self._inflight_encodes > 0):
                 self._model_lock.wait()
             if self._use_gpu_worker or self.device_name != "cpu":
                 return
@@ -1557,6 +1600,26 @@ def create_app(settings: Settings | None = None, runtime: EmbedderRuntime | None
             "model": resolved_settings.model_id,
             "stats": stats.snapshot(),
             "runtime": resolved_runtime.runtime_status(),
+        }
+
+    @app.post("/admin/device")
+    async def switch_device(
+        request: DeviceSwitchRequest,
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        _require_api_key(resolved_settings, authorization)
+        try:
+            runtime_status = await asyncio.get_running_loop().run_in_executor(
+                None,
+                functools.partial(resolved_runtime.switch_device, request.device),
+            )
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {
+            "service": resolved_settings.service_name,
+            "model": resolved_settings.model_id,
+            "runtime": runtime_status,
+            "stats": stats.snapshot(),
         }
 
     @app.get("/metricsz")

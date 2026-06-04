@@ -35,6 +35,9 @@ class Settings:
     batch_window_ms: int
     idle_offload_seconds: float
     idle_offload_poll_seconds: float
+    cpu_to_gpu_scale_up_texts: int
+    start_device: str
+    cuda_visible_devices: str | None
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -54,4 +57,7 @@ class Settings:
             batch_window_ms=_env_int("BATCH_WINDOW_MS", "200") or 200,
             idle_offload_seconds=float(os.getenv("IDLE_OFFLOAD_SECONDS", "1800")),
             idle_offload_poll_seconds=float(os.getenv("IDLE_OFFLOAD_POLL_SECONDS", "30")),
+            cpu_to_gpu_scale_up_texts=_env_int("CPU_TO_GPU_SCALE_UP_TEXTS", "8") or 0,
+            start_device=os.getenv("START_DEVICE", "auto").strip().lower(),
+            cuda_visible_devices=os.getenv("CUDA_VISIBLE_DEVICES") or None,
         )
