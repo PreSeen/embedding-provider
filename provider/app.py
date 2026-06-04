@@ -769,10 +769,7 @@ class EmbedderRuntime:
         except RuntimeError as exc:
             if not _is_cuda_oom(exc):
                 raise
-            if self._preferred_device == "cuda":
-                import torch
-
-                torch.cuda.empty_cache()
+            self._release_cuda_cache()
             if len(texts) <= 1:
                 raise ValueError(
                     "Embedding request exceeded GPU memory for a single input; reduce input length or lower MAX_LENGTH"
