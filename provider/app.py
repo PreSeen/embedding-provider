@@ -13,7 +13,7 @@ from pathlib import Path
 import subprocess
 import sys
 import time
-from collections import defaultdict, deque
+from collections import OrderedDict, defaultdict, deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -34,6 +34,8 @@ logging.basicConfig(level="INFO")
 _CUDA_VRAM_SAFETY_FIXED_BYTES = 512 * 1024 * 1024
 _CUDA_VRAM_SAFETY_TOTAL_RATIO = 0.05
 _CUDA_BATCH_GROWTH_FACTOR = 2
+_IN_MEMORY_RECORD_LIMIT = 100_000
+_EMBEDDING_CACHE_LIMIT = 100_000
 
 
 def _batched(values: list[str], batch_size: int) -> list[list[str]]:
@@ -243,7 +245,7 @@ class ProviderRuntimeStats:
 
 
 class RequestLogBuffer:
-    def __init__(self, *, max_inputs: int = 10_000, max_requests: int = 10_000) -> None:
+    def __init__(self, *, max_inputs: int = _IN_MEMORY_RECORD_LIMIT, max_requests: int = _IN_MEMORY_RECORD_LIMIT) -> None:
         self._lock = threading.Lock()
         self._inputs: deque[dict[str, Any]] = deque(maxlen=max_inputs)
         self._requests: deque[dict[str, Any]] = deque(maxlen=max_requests)
@@ -320,12 +322,12 @@ class RequestLogBuffer:
             entry["error_summary"] = error_summary
 
     def recent_inputs(self, *, limit: int = 200) -> list[dict[str, Any]]:
-        safe_limit = max(1, min(10_000, int(limit)))
+        safe_limit = max(1, min(_IN_MEMORY_RECORD_LIMIT, int(limit)))
         with self._lock:
             return list(self._inputs)[-safe_limit:][::-1]
 
     def recent_requests(self, *, limit: int = 200) -> list[dict[str, Any]]:
-        safe_limit = max(1, min(10_000, int(limit)))
+        safe_limit = max(1, min(_IN_MEMORY_RECORD_LIMIT, int(limit)))
         with self._lock:
             return [dict(item) for item in list(self._requests)[-safe_limit:][::-1]]
 
@@ -390,6 +392,58 @@ class RequestLogBuffer:
                 p95_index = min(len(values) - 1, math.ceil(len(values) * 0.95) - 1)
                 bucket["p95_duration_ms"] = round(values[p95_index], 3)
         return buckets
+
+
+EmbeddingCacheKey = tuple[str, int | None, str | None, str]
+
+
+class EmbeddingResultCache:
+    def __init__(self, *, max_entries: int = _EMBEDDING_CACHE_LIMIT) -> None:
+        self._max_entries = max(0, int(max_entries))
+        self._items: OrderedDict[EmbeddingCacheKey, tuple[float, ...]] = OrderedDict()
+        self._lock = threading.Lock()
+        self._hits = 0
+        self._misses = 0
+
+    def get_many(self, keys: list[EmbeddingCacheKey]) -> list[list[float] | None]:
+        if self._max_entries <= 0:
+            with self._lock:
+                self._misses += len(keys)
+            return [None] * len(keys)
+        results: list[list[float] | None] = []
+        with self._lock:
+            for key in keys:
+                cached = self._items.get(key)
+                if cached is None:
+                    self._misses += 1
+                    results.append(None)
+                    continue
+                self._hits += 1
+                self._items.move_to_end(key)
+                results.append(list(cached))
+        return results
+
+    def set_many(self, items: list[tuple[EmbeddingCacheKey, list[float]]]) -> None:
+        if self._max_entries <= 0 or not items:
+            return
+        with self._lock:
+            for key, embedding in items:
+                self._items[key] = tuple(float(value) for value in embedding)
+                self._items.move_to_end(key)
+            while len(self._items) > self._max_entries:
+                self._items.popitem(last=False)
+
+    def snapshot(self) -> dict[str, int | float]:
+        with self._lock:
+            total = self._hits + self._misses
+            hit_rate = round(self._hits / total, 4) if total else 0.0
+            return {
+                "entries": len(self._items),
+                "max_entries": self._max_entries,
+                "hits": self._hits,
+                "misses": self._misses,
+                "hit_rate": hit_rate,
+            }
 
 
 class AdaptiveBatchState:
@@ -1819,6 +1873,7 @@ async function refresh() {
   ]);
   const s = stats.stats;
   const r = stats.runtime;
+  const c = stats.cache || metrics.cache || {};
   const lastError = s.last_error_summary
     ? `${s.last_error_at ?? ""} ${s.last_error_request_id ?? ""}\n${s.last_error_summary}`
     : "no recorded errors";
@@ -1833,6 +1888,8 @@ async function refresh() {
     { label: "device", value: r.loaded_device },
     { label: "precision", value: r.precision ?? "-" },
     { label: "worker pid", value: r.worker_pid ?? "-" },
+    { label: "cache entries", value: `${c.entries ?? 0} / ${c.max_entries ?? "-"}` },
+    { label: "cache hit rate", value: `${((Number(c.hit_rate || 0)) * 100).toFixed(1)}%` },
     { label: "request texts", value: s.last_request_texts ?? "-" },
     { label: "batch size", value: s.last_batch_texts ?? "-" },
     {
@@ -1880,7 +1937,8 @@ def create_app(settings: Settings | None = None, runtime: EmbedderRuntime | None
     resolved_settings = settings or Settings.from_env()
     resolved_runtime = runtime or EmbedderRuntime(resolved_settings)
     stats = ProviderRuntimeStats()
-    request_log = RequestLogBuffer(max_inputs=10_000, max_requests=10_000)
+    request_log = RequestLogBuffer(max_inputs=_IN_MEMORY_RECORD_LIMIT, max_requests=_IN_MEMORY_RECORD_LIMIT)
+    embedding_cache = EmbeddingResultCache(max_entries=_EMBEDDING_CACHE_LIMIT)
     resolved_runtime.attach_stats(stats)
     batcher = ContinuousBatcher(resolved_runtime, stats=stats, window_secs=resolved_settings.batch_window_ms / 1000)
     input_length_validator = InputLengthValidator(resolved_settings)
@@ -1926,6 +1984,7 @@ def create_app(settings: Settings | None = None, runtime: EmbedderRuntime | None
             "batch_window_ms": resolved_settings.batch_window_ms,
             "runtime": resolved_runtime.runtime_status(),
             "stats": stats.snapshot(),
+            "cache": embedding_cache.snapshot(),
         }
 
     @app.get("/readyz")
@@ -1937,6 +1996,7 @@ def create_app(settings: Settings | None = None, runtime: EmbedderRuntime | None
             "model": resolved_settings.model_id,
             "runtime": runtime_status,
             "stats": stats.snapshot(),
+            "cache": embedding_cache.snapshot(),
         }
         return JSONResponse(status_code=200 if payload["ready"] else 503, content=payload)
 
@@ -1947,6 +2007,7 @@ def create_app(settings: Settings | None = None, runtime: EmbedderRuntime | None
             "model": resolved_settings.model_id,
             "stats": stats.snapshot(),
             "runtime": resolved_runtime.runtime_status(),
+            "cache": embedding_cache.snapshot(),
         }
 
     @app.post("/admin/device")
@@ -1967,6 +2028,7 @@ def create_app(settings: Settings | None = None, runtime: EmbedderRuntime | None
             "model": resolved_settings.model_id,
             "runtime": runtime_status,
             "stats": stats.snapshot(),
+            "cache": embedding_cache.snapshot(),
         }
 
     @app.get("/metricsz")
@@ -1985,6 +2047,7 @@ def create_app(settings: Settings | None = None, runtime: EmbedderRuntime | None
             ),
             "stats": stats.snapshot(),
             "runtime": resolved_runtime.runtime_status(),
+            "cache": embedding_cache.snapshot(),
         }
 
     @app.get("/request-logz")
@@ -1994,6 +2057,7 @@ def create_app(settings: Settings | None = None, runtime: EmbedderRuntime | None
             "model": resolved_settings.model_id,
             "inputs": request_log.recent_inputs(limit=limit),
             "requests": request_log.recent_requests(limit=limit),
+            "cache": embedding_cache.snapshot(),
         }
 
     @app.get("/dashboard", response_class=HTMLResponse)
@@ -2076,13 +2140,32 @@ def create_app(settings: Settings | None = None, runtime: EmbedderRuntime | None
             request.dimensions,
             request.task,
         )
+        effective_dimensions = request.dimensions or resolved_settings.default_dimensions
+        effective_task = request.task or resolved_settings.embedding_task
+        cache_keys: list[EmbeddingCacheKey] = [
+            (resolved_settings.model_id, effective_dimensions, effective_task, text)
+            for text in texts
+        ]
+        cached_embeddings = embedding_cache.get_many(cache_keys)
+        miss_indices = [idx for idx, embedding in enumerate(cached_embeddings) if embedding is None]
         try:
-            embeddings = await batcher.encode(
-                texts,
-                dimensions=request.dimensions,
-                task=request.task,
-                request_id=request_id,
-            )
+            if miss_indices:
+                miss_texts = [texts[idx] for idx in miss_indices]
+                miss_embeddings = await batcher.encode(
+                    miss_texts,
+                    dimensions=request.dimensions,
+                    task=request.task,
+                    request_id=request_id,
+                )
+                embedding_cache.set_many(
+                    [
+                        (cache_keys[idx], embedding)
+                        for idx, embedding in zip(miss_indices, miss_embeddings)
+                    ]
+                )
+                for idx, embedding in zip(miss_indices, miss_embeddings):
+                    cached_embeddings[idx] = embedding
+            embeddings = [embedding or [] for embedding in cached_embeddings]
         except ValueError as exc:
             duration_ms = (time.perf_counter() - started_at) * 1000
             error_summary = _summarize_exception(exc)

@@ -83,7 +83,7 @@ if "transformers" not in sys.modules:
     fake_transformers.AutoTokenizer = _FakeAutoTokenizer
     sys.modules["transformers"] = fake_transformers
 
-from provider.app import AdaptiveBatchState, RequestLogBuffer, _country_for_ip, create_app
+from provider.app import AdaptiveBatchState, EmbeddingResultCache, RequestLogBuffer, _country_for_ip, create_app
 from provider.config import Settings
 
 
@@ -353,6 +353,26 @@ def test_request_log_buffer_keeps_recent_inputs_and_qps_buckets() -> None:
     assert sum(bucket["requests"] for bucket in buckets) == 2
     assert sum(bucket["texts"] for bucket in buckets) == 4
     assert sum(bucket["failed"] for bucket in buckets) == 1
+
+
+def test_embedding_result_cache_eviction_and_snapshot() -> None:
+    cache = EmbeddingResultCache(max_entries=2)
+    keys = [
+        ("model", 4, "task", "alpha"),
+        ("model", 4, "task", "beta"),
+        ("model", 4, "task", "gamma"),
+    ]
+    cache.set_many([(keys[0], [1.0]), (keys[1], [2.0])])
+    assert cache.get_many([keys[0]]) == [[1.0]]
+
+    cache.set_many([(keys[2], [3.0])])
+    assert cache.get_many([keys[1], keys[2]]) == [None, [3.0]]
+
+    snapshot = cache.snapshot()
+    assert snapshot["entries"] == 2
+    assert snapshot["max_entries"] == 2
+    assert snapshot["hits"] == 2
+    assert snapshot["misses"] == 1
 
 
 def test_country_for_ip_identifies_local_networks() -> None:
