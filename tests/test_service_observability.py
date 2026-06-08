@@ -293,6 +293,29 @@ def test_adaptive_batch_state_keeps_target_stable_until_reset() -> None:
     assert state.snapshot()["last_batch_texts"] == 0
 
 
+def test_adaptive_batch_state_caps_growth_after_oom_backoff() -> None:
+    state = AdaptiveBatchState(configured_max_batch_size=64)
+    for text_count in [1, 2, 4, 8, 16, 32]:
+        state.record_successful_dispatch(text_count=text_count, vram_cap=64, allow_growth=True)
+
+    assert state.current_target == 64
+
+    state.record_oom_backoff(failed_text_count=64)
+    assert state.current_target == 32
+    assert state.snapshot()["oom_target_ceiling"] == 32
+
+    for _ in range(12):
+        state.record_successful_dispatch(text_count=32, vram_cap=64, allow_growth=True)
+        assert state.current_target == 32
+
+    state.record_oom_backoff(failed_text_count=32)
+    assert state.current_target == 16
+    assert state.snapshot()["oom_target_ceiling"] == 16
+
+    state.record_successful_dispatch(text_count=32, vram_cap=64, allow_growth=True)
+    assert state.current_target == 16
+
+
 def test_request_log_buffer_keeps_recent_inputs_and_qps_buckets() -> None:
     log = RequestLogBuffer(max_inputs=3, max_requests=10)
     log.record_start(

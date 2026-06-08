@@ -396,6 +396,7 @@ class AdaptiveBatchState:
         self._last_batch_texts = 0
         self._last_vram_cap: int | None = None
         self._adjustments_total = 0
+        self._oom_target_ceiling: int | None = None
         self._lock = threading.Lock()
 
     @property
@@ -412,6 +413,7 @@ class AdaptiveBatchState:
             self._current_target = self._initial_target
             self._last_batch_texts = 0
             self._last_vram_cap = None
+            self._oom_target_ceiling = None
             self._adjustments_total += 1
 
     def record_successful_dispatch(self, *, text_count: int, vram_cap: int | None, allow_growth: bool) -> None:
@@ -423,6 +425,8 @@ class AdaptiveBatchState:
             next_target = min(self._hard_cap, max(1, self._current_target * _CUDA_BATCH_GROWTH_FACTOR))
             if self._last_vram_cap is not None:
                 next_target = min(next_target, self._last_vram_cap)
+            if self._oom_target_ceiling is not None:
+                next_target = min(next_target, self._oom_target_ceiling)
             if next_target > self._current_target:
                 self._current_target = next_target
                 self._adjustments_total += 1
@@ -430,6 +434,11 @@ class AdaptiveBatchState:
     def record_oom_backoff(self, *, failed_text_count: int) -> None:
         with self._lock:
             next_target = max(self._initial_target, min(self._hard_cap, max(1, int(failed_text_count) // 2)))
+            self._oom_target_ceiling = (
+                next_target
+                if self._oom_target_ceiling is None
+                else min(self._oom_target_ceiling, next_target)
+            )
             if next_target < self._current_target:
                 self._current_target = next_target
                 self._adjustments_total += 1
@@ -442,6 +451,7 @@ class AdaptiveBatchState:
                 "hard_cap": self._hard_cap,
                 "last_batch_texts": self._last_batch_texts,
                 "last_vram_cap": self._last_vram_cap,
+                "oom_target_ceiling": self._oom_target_ceiling,
                 "adjustments_total": self._adjustments_total,
             }
 
@@ -533,6 +543,13 @@ class InputLengthValidator:
                     trust_remote_code=self._settings.trust_remote_code,
                 )
             return self._tokenizer
+
+
+@dataclass
+class _EncodeResult:
+    embeddings: list[list[float]]
+    max_forward_texts: int
+    had_oom_backoff: bool = False
 
 
 class ModelInfo(BaseModel):
@@ -1091,9 +1108,12 @@ class EmbedderRuntime:
         *,
         dimensions: int | None = None,
         task: str | None = None,
-    ) -> list[list[float]]:
+    ) -> _EncodeResult:
         try:
-            return self._encode_once(texts, dimensions=dimensions, task=task)
+            return _EncodeResult(
+                embeddings=self._encode_once(texts, dimensions=dimensions, task=task),
+                max_forward_texts=len(texts),
+            )
         except RuntimeError as exc:
             if not _is_cuda_oom(exc):
                 raise
@@ -1126,7 +1146,11 @@ class EmbedderRuntime:
                         self._settings.max_length,
                         self.device_name,
                     )
-                    return self._encode_once(texts, dimensions=dimensions, task=task)
+                    return _EncodeResult(
+                        embeddings=self._encode_once(texts, dimensions=dimensions, task=task),
+                        max_forward_texts=1,
+                        had_oom_backoff=True,
+                    )
                 except RuntimeError as retry_exc:
                     if not _is_cuda_oom(retry_exc):
                         raise
@@ -1155,7 +1179,11 @@ class EmbedderRuntime:
             )
             left = self._encode_with_backoff(texts[:split_at], dimensions=dimensions, task=task)
             right = self._encode_with_backoff(texts[split_at:], dimensions=dimensions, task=task)
-            return [*left, *right]
+            return _EncodeResult(
+                embeddings=[*left.embeddings, *right.embeddings],
+                max_forward_texts=max(left.max_forward_texts, right.max_forward_texts),
+                had_oom_backoff=True,
+            )
 
     def _diagnostic_token_count(self, texts: list[str]) -> int | None:
         try:
@@ -1187,14 +1215,15 @@ class EmbedderRuntime:
                     chunk_target = min(max_batch_size, self.adaptive_batch.effective_target(vram_cap=vram_cap))
                 chunk_size = max(1, min(chunk_target, remaining))
                 chunk = texts[offset: offset + chunk_size]
-                embeddings.extend(self._encode_with_backoff(chunk, dimensions=dimensions, task=task))
+                result = self._encode_with_backoff(chunk, dimensions=dimensions, task=task)
+                embeddings.extend(result.embeddings)
                 offset += chunk_size
                 if self._preferred_device == "cuda":
                     vram_cap = self._estimate_vram_text_cap()
                     self.adaptive_batch.record_successful_dispatch(
-                        text_count=chunk_size,
+                        text_count=result.max_forward_texts,
                         vram_cap=vram_cap,
-                        allow_growth=allow_batch_growth or offset < len(texts),
+                        allow_growth=(allow_batch_growth or offset < len(texts)) and not result.had_oom_backoff,
                     )
             succeeded = True
             return embeddings
