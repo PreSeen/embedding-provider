@@ -348,6 +348,8 @@ class RequestLogBuffer:
                     "failed": 0,
                     "texts": 0,
                     "qps": 0.0,
+                    "tps": 0.0,
+                    "avg_texts_per_request": 0.0,
                     "avg_duration_ms": None,
                     "p95_duration_ms": None,
                 }
@@ -376,6 +378,12 @@ class RequestLogBuffer:
                 durations[index].append(float(duration))
         for bucket, values in zip(buckets, durations):
             bucket["qps"] = round(bucket["requests"] / bucket_size, 4)
+            bucket["tps"] = round(bucket["texts"] / bucket_size, 4)
+            bucket["avg_texts_per_request"] = (
+                round(bucket["texts"] / bucket["requests"], 2)
+                if bucket["requests"]
+                else 0.0
+            )
             if values:
                 values.sort()
                 bucket["avg_duration_ms"] = round(sum(values) / len(values), 3)
@@ -1638,6 +1646,7 @@ class QpsChart extends HTMLElement {
         .axis { stroke: #444; stroke-width: 1; }
         .grid { stroke: #292929; stroke-width: 1; }
         .line { fill: none; stroke: #7cc7ff; stroke-width: 2.5; }
+        .line.texts { stroke: #8fd18f; }
         .area { fill: #7cc7ff; opacity: 0.14; }
         .tick { fill: #9a9a9a; font: 11px system-ui; }
         .crosshair { stroke: #777; stroke-width: 1; stroke-dasharray: 3 3; }
@@ -1650,10 +1659,17 @@ class QpsChart extends HTMLElement {
         }
         .tooltip strong { display: block; margin-bottom: 4px; color: #fff; font-size: 12px; }
         .tooltip span { color: #aaa; }
+        .legend { display: flex; gap: 12px; align-items: center; }
+        .legend b { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 5px; }
+        .legend .qps b { background: #7cc7ff; }
+        .legend .tps b { background: #8fd18f; }
       </style>
       <div class="frame">
         <div class="chart-head">
-          <div>QPS trend</div>
+          <div class="legend">
+            <span class="qps"><b></b>request QPS</span>
+            <span class="tps"><b></b>text/s</span>
+          </div>
           <span>last 1h</span>
         </div>
         <svg></svg>
@@ -1699,15 +1715,28 @@ class QpsChart extends HTMLElement {
     return { x, y };
   }
 
+  textPointFor(index, maxTps) {
+    const pad = { left: 58, right: 22, top: 44, bottom: 34 };
+    const width = this.size.width - pad.left - pad.right;
+    const height = this.size.height - pad.top - pad.bottom;
+    const bucket = this.buckets[index] || {};
+    const x = pad.left + (this.buckets.length <= 1 ? 0 : (index / (this.buckets.length - 1)) * width);
+    const y = pad.top + height - (((bucket.tps || 0) / maxTps) * height);
+    return { x, y };
+  }
+
   render() {
     const buckets = this.buckets;
     const maxQps = Math.max(0.01, ...buckets.map(b => b.qps || 0));
+    const maxTps = Math.max(0.01, ...buckets.map(b => b.tps || 0));
     const yTicks = [0, maxQps / 2, maxQps];
     const pad = { left: 58, right: 22, top: 44, bottom: 34 };
     const width = this.size.width - pad.left - pad.right;
     const height = this.size.height - pad.top - pad.bottom;
     const points = buckets.map((_, index) => this.pointFor(index, maxQps));
+    const textPoints = buckets.map((_, index) => this.textPointFor(index, maxTps));
     const line = points.map((p, index) => `${index === 0 ? "M" : "L"} ${p.x.toFixed(1)} ${p.y.toFixed(1)}`).join(" ");
+    const textLine = textPoints.map((p, index) => `${index === 0 ? "M" : "L"} ${p.x.toFixed(1)} ${p.y.toFixed(1)}`).join(" ");
     const area = points.length
       ? `${line} L ${points[points.length - 1].x.toFixed(1)} ${pad.top + height} L ${pad.left} ${pad.top + height} Z`
       : "";
@@ -1726,7 +1755,7 @@ class QpsChart extends HTMLElement {
       <line class="axis" x1="${pad.left}" y1="${pad.top + height}" x2="${pad.left + width}" y2="${pad.top + height}"></line>
       ${start ? `<text class="tick" x="${pad.left}" y="${this.size.height - 10}">${start.toLocaleTimeString()}</text>` : ""}
       ${end ? `<text class="tick" x="${pad.left + width - 72}" y="${this.size.height - 10}">${end.toLocaleTimeString()}</text>` : ""}
-      ${area ? `<path class="area" d="${area}"></path><path class="line" d="${line}"></path>` : ""}
+      ${area ? `<path class="area" d="${area}"></path><path class="line" d="${line}"></path><path class="line texts" d="${textLine}"></path>` : ""}
       ${hover ? `<line class="crosshair" x1="${hover.x}" y1="${pad.top}" x2="${hover.x}" y2="${pad.top + height}"></line>
         <circle class="dot" cx="${hover.x}" cy="${hover.y}" r="4"></circle>` : ""}
     `;
@@ -1747,9 +1776,11 @@ class QpsChart extends HTMLElement {
     const time = new Date(bucket.start_epoch * 1000).toLocaleString();
     this.tooltip.innerHTML = `
       <strong>${esc(time)}</strong>
-      <div><span>QPS</span> ${Number(bucket.qps || 0).toFixed(4)}</div>
+      <div><span>request QPS</span> ${Number(bucket.qps || 0).toFixed(4)}</div>
+      <div><span>text/s</span> ${Number(bucket.tps || 0).toFixed(4)}</div>
       <div><span>requests</span> ${esc(bucket.requests)}</div>
       <div><span>texts</span> ${esc(bucket.texts)}</div>
+      <div><span>avg texts/request</span> ${Number(bucket.avg_texts_per_request || 0).toFixed(2)}</div>
       <div><span>failed</span> ${esc(bucket.failed)}</div>
       <div><span>p95</span> ${bucket.p95_duration_ms ?? "-"} ms</div>
     `;
@@ -1791,8 +1822,13 @@ async function refresh() {
   const lastError = s.last_error_summary
     ? `${s.last_error_at ?? ""} ${s.last_error_request_id ?? ""}\n${s.last_error_summary}`
     : "no recorded errors";
+  const latestBucket = [...(metrics.buckets || [])].reverse().find(bucket => Number(bucket.requests || 0) > 0)
+    || (metrics.buckets || [])[metrics.buckets.length - 1]
+    || {};
   const cardRows = [
     { label: "requests", value: s.requests_total },
+    { label: "request qps", value: Number(latestBucket.qps || 0).toFixed(3) },
+    { label: "text/s", value: Number(latestBucket.tps || 0).toFixed(1) },
     { label: "inflight / queue", value: `${r.inflight_encodes} / ${s.queue_depth}` },
     { label: "device", value: r.loaded_device },
     { label: "precision", value: r.precision ?? "-" },
