@@ -76,7 +76,17 @@ if "transformers" not in sys.modules:
         def from_pretrained(*args, **kwargs):
             return _BootstrapModel()
 
+    class _FakeTokenizer:
+        def __call__(self, text: str, **kwargs):
+            return {"input_ids": text.split()}
+
+    class _FakeAutoTokenizer:
+        @staticmethod
+        def from_pretrained(*args, **kwargs):
+            return _FakeTokenizer()
+
     fake_transformers.AutoModel = _FakeAutoModel
+    fake_transformers.AutoTokenizer = _FakeAutoTokenizer
     sys.modules["transformers"] = fake_transformers
 
 from provider.app import EmbedderRuntime
@@ -123,6 +133,21 @@ class FailingStartWorker(FakeWorker):
     def ensure_started(self) -> str:
         self.starts += 1
         raise RuntimeError("CUDA out of memory while loading model")
+
+
+class TransientOomWorker(FakeWorker):
+    def __init__(self, settings: Settings) -> None:
+        super().__init__(settings)
+        self.failures_remaining = 1
+
+    def encode(self, texts: list[str], *, dimensions: int | None = None, task: str | None = None):
+        self.ensure_started()
+        if self.failures_remaining > 0:
+            self.failures_remaining -= 1
+            raise RuntimeError("CUDA out of memory during encode")
+        self.batch_sizes.append(len(texts))
+        width = dimensions or 4
+        return np.ones((len(texts), width), dtype=np.float32).tolist(), 1024.0
 
 
 class EmbedderRuntimeIdleOffloadTests(unittest.TestCase):
@@ -307,6 +332,30 @@ class EmbedderRuntimeIdleOffloadTests(unittest.TestCase):
             finally:
                 runtime.close()
 
+    def test_single_input_cuda_oom_retries_after_empty_cache(self) -> None:
+        workers: list[TransientOomWorker] = []
+
+        def fake_worker_factory(settings: Settings) -> TransientOomWorker:
+            worker = TransientOomWorker(settings)
+            workers.append(worker)
+            return worker
+
+        with (
+            patch("provider.app._GpuEmbedderWorker", side_effect=fake_worker_factory),
+            patch("provider.app._detect_preferred_device", return_value="cuda"),
+            patch("provider.app._probe_cuda_memory_bytes", return_value=(8 * 1024**3, 24 * 1024**3)),
+        ):
+            runtime = EmbedderRuntime(Settings.from_env())
+            try:
+                embeddings = runtime.encode(["retry me"])
+            finally:
+                runtime.close()
+
+        self.assertEqual(len(embeddings), 1)
+        self.assertEqual(len(workers), 1)
+        self.assertEqual(workers[0].cache_releases, 1)
+        self.assertEqual(workers[0].batch_sizes, [1])
+
     def test_gpu_worker_start_failure_falls_back_to_cpu(self) -> None:
         workers: list[FailingStartWorker] = []
 
@@ -382,7 +431,7 @@ class EmbedderRuntimeIdleOffloadTests(unittest.TestCase):
         self.assertEqual(len(workers), 1)
         self.assertEqual(workers[0].batch_sizes, [1, 2, 1])
 
-    def test_cuda_batch_target_drops_when_following_request_is_smaller(self) -> None:
+    def test_cuda_batch_target_stays_stable_when_following_request_is_smaller(self) -> None:
         workers: list[FakeWorker] = []
 
         def fake_worker_factory(settings: Settings) -> FakeWorker:
@@ -400,12 +449,14 @@ class EmbedderRuntimeIdleOffloadTests(unittest.TestCase):
                 runtime.encode([f"large-{idx}" for idx in range(8)])
                 runtime.encode(["small-a", "small-b"])
                 runtime.encode([f"again-{idx}" for idx in range(5)])
+                status = runtime.runtime_status()
             finally:
                 runtime.close()
 
         self.assertEqual(len(workers), 1)
-        self.assertEqual(workers[0].batch_sizes, [1, 2, 4, 1, 2, 2, 3])
-        self.assertEqual(workers[0].cache_releases, 1)
+        self.assertEqual(workers[0].batch_sizes, [1, 2, 4, 1, 2, 5])
+        self.assertEqual(workers[0].cache_releases, 0)
+        self.assertEqual(status["adaptive_batch"]["current_target"], 8)
 
 
 if __name__ == "__main__":

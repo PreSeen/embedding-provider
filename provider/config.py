@@ -35,6 +35,7 @@ class Settings:
     batch_window_ms: int
     idle_offload_seconds: float
     idle_offload_poll_seconds: float
+    cpu_batch_target: int
     cpu_to_gpu_scale_up_texts: int
     gpu_to_cpu_scale_down_texts: int
     gpu_to_cpu_scale_down_seconds: float
@@ -59,6 +60,7 @@ class Settings:
             batch_window_ms=_env_int("BATCH_WINDOW_MS", "200") or 200,
             idle_offload_seconds=float(os.getenv("IDLE_OFFLOAD_SECONDS", "1800")),
             idle_offload_poll_seconds=float(os.getenv("IDLE_OFFLOAD_POLL_SECONDS", "30")),
+            cpu_batch_target=_env_int("CPU_BATCH_TARGET", "8") or 8,
             cpu_to_gpu_scale_up_texts=_env_int("CPU_TO_GPU_SCALE_UP_TEXTS", "8") or 0,
             gpu_to_cpu_scale_down_texts=_env_int("GPU_TO_CPU_SCALE_DOWN_TEXTS", "2") or 0,
             gpu_to_cpu_scale_down_seconds=float(os.getenv("GPU_TO_CPU_SCALE_DOWN_SECONDS", "30")),

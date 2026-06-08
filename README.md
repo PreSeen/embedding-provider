@@ -88,6 +88,7 @@ curl http://127.0.0.1:8000/statsz
 - Provider defaults:
   - `MAX_LENGTH=8192`
   - `MAX_BATCH_SIZE=64`
+  - `CPU_BATCH_TARGET=8`
   - `DEFAULT_DIMENSIONS=768`
   - `IDLE_OFFLOAD_SECONDS=1800`
 
@@ -110,7 +111,7 @@ This only affects the embedding-provider process itself. It does not touch the O
 
 ## VRAM-Aware Batching
 
-On CUDA hosts, `MAX_BATCH_SIZE` is a hard upper bound, not the batch size used blindly. Before the runtime has a GPU memory sample, it probes with a single text. The GPU worker reports peak memory growth per text for that real encode call, and later chunks use the current free VRAM minus safety headroom to choose the next batch size. Batch growth is ramped after the probe, so the runtime grows at most 1, 2, 4, 8, and onward instead of jumping directly to the hard cap. The runtime keeps this target across requests and lowers it when a following request is smaller than the current target. If available VRAM is below the safety headroom, the runtime keeps forwarding one text at a time. CUDA OOM backoff remains the final guard for unusually large inputs.
+On CUDA hosts, `MAX_BATCH_SIZE` is a hard upper bound, not the batch size used blindly. Before the runtime has a GPU memory sample, it probes with a single text. The GPU worker reports peak memory growth per text for that real encode call, and later chunks use the current free VRAM minus safety headroom to choose the next batch size. Batch growth is ramped after the probe, so the runtime grows at most 1, 2, 4, 8, and onward instead of jumping directly to the hard cap. The CUDA target stays stable across small follow-up requests; sustained small batches are handled by scaling back down to CPU. If available VRAM is below the safety headroom, the runtime keeps forwarding one text at a time. CUDA OOM backoff remains the final guard for unusually large inputs. On CPU, `CPU_BATCH_TARGET` controls the normal queue-drain target, with `MAX_BATCH_SIZE` still acting as the hard upper bound.
 
 ## Remote Sync
 

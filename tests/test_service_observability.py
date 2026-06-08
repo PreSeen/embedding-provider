@@ -70,7 +70,17 @@ if "transformers" not in sys.modules:
         def from_pretrained(*args, **kwargs):
             return _BootstrapModel()
 
+    class _FakeTokenizer:
+        def __call__(self, text: str, **kwargs):
+            return {"input_ids": text.split()}
+
+    class _FakeAutoTokenizer:
+        @staticmethod
+        def from_pretrained(*args, **kwargs):
+            return _FakeTokenizer()
+
     fake_transformers.AutoModel = _FakeAutoModel
+    fake_transformers.AutoTokenizer = _FakeAutoTokenizer
     sys.modules["transformers"] = fake_transformers
 
 from provider.app import AdaptiveBatchState, RequestLogBuffer, _country_for_ip, create_app
@@ -81,10 +91,12 @@ from provider.config import Settings
 class FakeRuntime:
     reload_in_progress: bool = False
     fail_with: Exception | None = None
+    estimate_max_texts_value: int = 128
 
     def __post_init__(self) -> None:
         self._stats = None
         self.device_name = "cpu"
+        self.seen_batches: list[int] = []
 
     def attach_stats(self, stats: Any) -> None:
         self._stats = stats
@@ -107,11 +119,12 @@ class FakeRuntime:
     def encode(self, texts: list[str], *, dimensions: int | None = None, task: str | None = None) -> list[list[float]]:
         if self.fail_with is not None:
             raise self.fail_with
+        self.seen_batches.append(len(texts))
         width = dimensions or 4
         return [[float(idx + 1)] * width for idx, _text in enumerate(texts)]
 
     def estimate_max_texts(self) -> int:
-        return 128
+        return self.estimate_max_texts_value
 
     def close(self) -> None:
         return None
@@ -134,6 +147,7 @@ def _settings() -> Settings:
         batch_window_ms=1,
         idle_offload_seconds=0,
         idle_offload_poll_seconds=0,
+        cpu_batch_target=8,
         cpu_to_gpu_scale_up_texts=8,
         gpu_to_cpu_scale_down_texts=2,
         gpu_to_cpu_scale_down_seconds=30,
@@ -222,6 +236,32 @@ def test_embeddings_failure_updates_error_stats_and_preserves_request_id() -> No
         assert "ValueError" in str(stats["last_error_summary"])
 
 
+def test_embeddings_rejects_inputs_over_configured_token_limit() -> None:
+    app = create_app(settings=_settings(), runtime=FakeRuntime())
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.post(
+            "/v1/embeddings",
+            headers={
+                "Authorization": "Bearer test-key",
+                "X-Request-Id": "embed-req-long",
+            },
+            json={
+                "model": "jinaai/jina-embeddings-v5-text-nano",
+                "input": " ".join(f"tok-{idx}" for idx in range(300)),
+            },
+        )
+
+        assert response.status_code == 400
+        assert response.headers["X-Request-Id"] == "embed-req-long"
+        assert "exceeds MAX_LENGTH=256" in response.json()["detail"]
+
+        stats = client.get("/statsz").json()["stats"]
+        assert stats["requests_total"] == 1
+        assert stats["requests_failed"] == 1
+        assert stats["last_error_request_id"] == "embed-req-long"
+        assert "exceeds MAX_LENGTH=256" in str(stats["last_error_summary"])
+
+
 def test_adaptive_batch_state_grows_conservatively_after_full_dispatches() -> None:
     state = AdaptiveBatchState(configured_max_batch_size=64)
 
@@ -237,7 +277,7 @@ def test_adaptive_batch_state_grows_conservatively_after_full_dispatches() -> No
     assert state.current_target == 4
 
 
-def test_adaptive_batch_state_respects_request_shrink_and_reset() -> None:
+def test_adaptive_batch_state_keeps_target_stable_until_reset() -> None:
     state = AdaptiveBatchState(configured_max_batch_size=64)
     state.record_successful_dispatch(text_count=1, vram_cap=64, allow_growth=True)
     state.record_successful_dispatch(text_count=2, vram_cap=64, allow_growth=True)
@@ -245,12 +285,8 @@ def test_adaptive_batch_state_respects_request_shrink_and_reset() -> None:
 
     assert state.current_target == 8
 
-    shrank = state.record_request_complete(total_texts=2, request_start_target=8)
-    assert shrank is True
-    assert state.current_target == 2
-
-    shrank = state.record_request_complete(total_texts=2, request_start_target=2)
-    assert shrank is False
+    state.record_successful_dispatch(text_count=2, vram_cap=64, allow_growth=False)
+    assert state.current_target == 8
 
     state.reset()
     assert state.current_target == 1

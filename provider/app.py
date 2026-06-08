@@ -34,6 +34,8 @@ logging.basicConfig(level="INFO")
 _CUDA_VRAM_SAFETY_FIXED_BYTES = 512 * 1024 * 1024
 _CUDA_VRAM_SAFETY_TOTAL_RATIO = 0.05
 _CUDA_BATCH_GROWTH_FACTOR = 2
+
+
 def _batched(values: list[str], batch_size: int) -> list[list[str]]:
     if batch_size <= 0:
         return [values]
@@ -151,6 +153,7 @@ class ProviderRuntimeStats:
         self._texts_total = 0
         self._batches_total = 0
         self._batch_texts_total = 0
+        self._last_batch_texts = 0
         self._running_batch_texts = 0
         self._queue_depth = 0
         self._oldest_queue_age_seconds = 0.0
@@ -158,6 +161,7 @@ class ProviderRuntimeStats:
         self._offloads_total = 0
         self._last_request_at: str | None = None
         self._last_request_id: str | None = None
+        self._last_request_texts = 0
         self._last_success_at: str | None = None
         self._last_success_request_id: str | None = None
         self._last_error_at: str | None = None
@@ -171,6 +175,7 @@ class ProviderRuntimeStats:
             self._texts_total += text_count
             self._last_request_at = _utc_now_iso()
             self._last_request_id = request_id
+            self._last_request_texts = max(0, text_count)
 
     def record_request_success(self, *, request_id: str, duration_ms: float) -> None:
         with self._lock:
@@ -191,6 +196,7 @@ class ProviderRuntimeStats:
         with self._lock:
             self._batches_total += 1
             self._batch_texts_total += text_count
+            self._last_batch_texts = max(0, text_count)
 
     def set_running_batch(self, *, text_count: int) -> None:
         with self._lock:
@@ -218,6 +224,7 @@ class ProviderRuntimeStats:
                 "texts_total": self._texts_total,
                 "batches_total": self._batches_total,
                 "batch_texts_total": self._batch_texts_total,
+                "last_batch_texts": self._last_batch_texts,
                 "running_batch_texts": self._running_batch_texts,
                 "queue_depth": self._queue_depth,
                 "oldest_queue_age_seconds": self._oldest_queue_age_seconds,
@@ -225,6 +232,7 @@ class ProviderRuntimeStats:
                 "offloads_total": self._offloads_total,
                 "last_request_at": self._last_request_at,
                 "last_request_id": self._last_request_id,
+                "last_request_texts": self._last_request_texts,
                 "last_success_at": self._last_success_at,
                 "last_success_request_id": self._last_success_request_id,
                 "last_error_at": self._last_error_at,
@@ -419,15 +427,12 @@ class AdaptiveBatchState:
                 self._current_target = next_target
                 self._adjustments_total += 1
 
-    def record_request_complete(self, *, total_texts: int, request_start_target: int) -> bool:
+    def record_oom_backoff(self, *, failed_text_count: int) -> None:
         with self._lock:
-            if total_texts < request_start_target:
-                next_target = max(self._initial_target, min(self._hard_cap, int(total_texts)))
-                if next_target != self._current_target:
-                    self._current_target = next_target
-                    self._adjustments_total += 1
-                    return True
-            return False
+            next_target = max(self._initial_target, min(self._hard_cap, max(1, int(failed_text_count) // 2)))
+            if next_target < self._current_target:
+                self._current_target = next_target
+                self._adjustments_total += 1
 
     def snapshot(self) -> dict[str, int | None]:
         with self._lock:
@@ -476,6 +481,58 @@ class EmbeddingResponse(BaseModel):
 
 class DeviceSwitchRequest(BaseModel):
     device: Literal["cpu", "cuda"]
+
+
+class InputLengthValidator:
+    def __init__(self, settings: Settings) -> None:
+        self._settings = settings
+        self._tokenizer: Any | None = None
+        self._lock = threading.Lock()
+
+    @property
+    def max_length(self) -> int | None:
+        return self._settings.max_length
+
+    def token_counts(self, texts: list[str]) -> list[int]:
+        tokenizer = self._get_tokenizer()
+        counts: list[int] = []
+        for text in texts:
+            encoded = tokenizer(
+                f"Document: {text}",
+                add_special_tokens=True,
+                truncation=False,
+                return_attention_mask=False,
+                return_token_type_ids=False,
+            )
+            counts.append(len(encoded["input_ids"]))
+        return counts
+
+    def validate(self, texts: list[str]) -> list[int]:
+        max_length = self.max_length
+        if not max_length:
+            return []
+        counts = self.token_counts(texts)
+        for index, count in enumerate(counts):
+            if count > max_length:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"input[{index}] exceeds MAX_LENGTH={max_length}: "
+                        f"{count} tokens"
+                    ),
+                )
+        return counts
+
+    def _get_tokenizer(self) -> Any:
+        with self._lock:
+            if self._tokenizer is None:
+                from transformers import AutoTokenizer
+
+                self._tokenizer = AutoTokenizer.from_pretrained(
+                    self._settings.model_id,
+                    trust_remote_code=self._settings.trust_remote_code,
+                )
+            return self._tokenizer
 
 
 class ModelInfo(BaseModel):
@@ -617,6 +674,7 @@ class EmbedderRuntime:
         self._encode_signature = None if self._model is None else inspect.signature(self._model.encode)
         self._bytes_per_text_ema: float | None = None
         self._ema_alpha = 0.25
+        self._input_length_validator = InputLengthValidator(settings)
         self.adaptive_batch = AdaptiveBatchState(settings.max_batch_size)
         self._engine_state = "offloaded" if self._use_gpu_worker else "hot"
         self._reload_in_progress = False
@@ -696,6 +754,8 @@ class EmbedderRuntime:
                 "idle_offload_poll_seconds": (
                     self._settings.idle_offload_poll_seconds if self._idle_offload_enabled else None
                 ),
+                "cpu_batch_target": self._settings.cpu_batch_target,
+                "effective_batch_target": self.estimate_max_texts(),
                 "cpu_to_gpu_scale_up_texts": self._settings.cpu_to_gpu_scale_up_texts,
                 "gpu_to_cpu_scale_down_texts": self._settings.gpu_to_cpu_scale_down_texts,
                 "gpu_to_cpu_scale_down_seconds": self._settings.gpu_to_cpu_scale_down_seconds,
@@ -1038,13 +1098,58 @@ class EmbedderRuntime:
             if not _is_cuda_oom(exc):
                 raise
             self._release_cuda_cache()
+            if self._preferred_device == "cuda":
+                self.adaptive_batch.record_oom_backoff(failed_text_count=len(texts))
+            token_count = self._diagnostic_token_count(texts)
+            char_count = sum(len(text) for text in texts)
+            free_vram, total_vram = _probe_cuda_memory_bytes()
+            log.warning(
+                "CUDA OOM for model=%s batch_size=%s token_count=%s char_count=%d "
+                "max_length=%s device=%s free_vram_bytes=%s total_vram_bytes=%s",
+                self._settings.model_id,
+                len(texts),
+                token_count,
+                char_count,
+                self._settings.max_length,
+                self.device_name,
+                free_vram,
+                total_vram,
+            )
             if len(texts) <= 1:
+                try:
+                    log.warning(
+                        "retrying single-input CUDA OOM after empty_cache: model=%s token_count=%s "
+                        "char_count=%d max_length=%s device=%s",
+                        self._settings.model_id,
+                        token_count,
+                        char_count,
+                        self._settings.max_length,
+                        self.device_name,
+                    )
+                    return self._encode_once(texts, dimensions=dimensions, task=task)
+                except RuntimeError as retry_exc:
+                    if not _is_cuda_oom(retry_exc):
+                        raise
+                    self._release_cuda_cache()
+                    retry_free_vram, retry_total_vram = _probe_cuda_memory_bytes()
+                    log.warning(
+                        "single-input CUDA OOM persisted after empty_cache: model=%s token_count=%s "
+                        "char_count=%d max_length=%s device=%s free_vram_bytes=%s total_vram_bytes=%s",
+                        self._settings.model_id,
+                        token_count,
+                        char_count,
+                        self._settings.max_length,
+                        self.device_name,
+                        retry_free_vram,
+                        retry_total_vram,
+                    )
                 raise ValueError(
-                    "Embedding request exceeded GPU memory for a single input; reduce input length or lower MAX_LENGTH"
+                    "Embedding request exceeded GPU memory for a single input after CUDA cache retry; "
+                    f"token_count={token_count}, char_count={char_count}, MAX_LENGTH={self._settings.max_length}"
                 ) from exc
             split_at = max(1, len(texts) // 2)
             log.warning(
-                "CUDA OOM for model=%s batch_size=%s; retrying with smaller batches",
+                "retrying CUDA OOM with smaller batches: model=%s batch_size=%s",
                 self._settings.model_id,
                 len(texts),
             )
@@ -1052,20 +1157,33 @@ class EmbedderRuntime:
             right = self._encode_with_backoff(texts[split_at:], dimensions=dimensions, task=task)
             return [*left, *right]
 
-    def encode(self, texts: list[str], *, dimensions: int | None = None, task: str | None = None) -> list[list[float]]:
+    def _diagnostic_token_count(self, texts: list[str]) -> int | None:
+        try:
+            return sum(self._input_length_validator.token_counts(texts))
+        except Exception:
+            return None
+
+    def encode(
+        self,
+        texts: list[str],
+        *,
+        dimensions: int | None = None,
+        task: str | None = None,
+        allow_batch_growth: bool = False,
+    ) -> list[list[float]]:
         self._begin_encode(len(texts))
         succeeded = False
         try:
             embeddings: list[list[float]] = []
             offset = 0
-            cuda_request_start_target = self.adaptive_batch.current_target if self._preferred_device == "cuda" else None
             while offset < len(texts):
                 remaining = len(texts) - offset
                 max_batch_size = self._settings.max_batch_size or remaining
                 vram_cap: int | None = None
                 chunk_target = max_batch_size
                 if self._preferred_device == "cuda":
-                    vram_cap = self._estimate_vram_text_cap()
+                    if self.adaptive_batch.current_target <= 1:
+                        vram_cap = self._estimate_vram_text_cap()
                     chunk_target = min(max_batch_size, self.adaptive_batch.effective_target(vram_cap=vram_cap))
                 chunk_size = max(1, min(chunk_target, remaining))
                 chunk = texts[offset: offset + chunk_size]
@@ -1076,15 +1194,8 @@ class EmbedderRuntime:
                     self.adaptive_batch.record_successful_dispatch(
                         text_count=chunk_size,
                         vram_cap=vram_cap,
-                        allow_growth=offset < len(texts),
+                        allow_growth=allow_batch_growth or offset < len(texts),
                     )
-            if cuda_request_start_target is not None and len(texts) < cuda_request_start_target:
-                shrank = self.adaptive_batch.record_request_complete(
-                    total_texts=len(texts),
-                    request_start_target=cuda_request_start_target,
-                )
-                if shrank:
-                    self._release_cuda_cache()
             succeeded = True
             return embeddings
         finally:
@@ -1127,10 +1238,11 @@ class EmbedderRuntime:
         self._switch_to_cpu(mark_offload=True)
 
     def estimate_max_texts(self) -> int:
-        vram_cap = self._estimate_vram_text_cap()
         if self._preferred_device == "cuda":
+            vram_cap = self._estimate_vram_text_cap() if self.adaptive_batch.current_target <= 1 else None
             return self.adaptive_batch.effective_target(vram_cap=vram_cap)
-        return vram_cap
+        vram_cap = self._estimate_vram_text_cap()
+        return min(vram_cap, max(1, self._settings.cpu_batch_target))
 
     def _estimate_vram_text_cap(self) -> int:
         """Return a safe upper bound on texts for the next forward pass based on free VRAM."""
@@ -1154,11 +1266,19 @@ class EmbedderRuntime:
 
 
 @dataclass
+class _PendingRequestState:
+    future: asyncio.Future  # resolved with list[list[float]]
+    embeddings: list[list[float] | None]
+    remaining: int
+
+
+@dataclass
 class _PendingItem:
-    texts: list[str]
+    text: str
+    input_index: int
     dimensions: int | None
     task: str | None
-    future: asyncio.Future  # resolved with list[list[float]]
+    state: _PendingRequestState
     enqueued_at: float
     request_id: str
 
@@ -1209,18 +1329,25 @@ class ContinuousBatcher:
     ) -> list[list[float]]:
         loop = asyncio.get_running_loop()
         future: asyncio.Future[list[list[float]]] = loop.create_future()
-        enqueued_at = time.monotonic()
-        await self._queue.put(
-            _PendingItem(
-                texts=texts,
-                dimensions=dimensions,
-                task=task,
-                future=future,
-                enqueued_at=enqueued_at,
-                request_id=request_id,
-            )
+        state = _PendingRequestState(
+            future=future,
+            embeddings=[None] * len(texts),
+            remaining=len(texts),
         )
-        self._mark_enqueued(enqueued_at)
+        for input_index, text in enumerate(texts):
+            enqueued_at = time.monotonic()
+            await self._queue.put(
+                _PendingItem(
+                    text=text,
+                    input_index=input_index,
+                    dimensions=dimensions,
+                    task=task,
+                    state=state,
+                    enqueued_at=enqueued_at,
+                    request_id=request_id,
+                )
+            )
+            self._mark_enqueued(enqueued_at)
         return await future
 
     async def _worker(self) -> None:
@@ -1242,12 +1369,28 @@ class ContinuousBatcher:
                         pending.append(item)
                     except (asyncio.TimeoutError, TimeoutError):
                         break
+            else:
+                ready_items: list[_PendingItem] = []
+                while True:
+                    try:
+                        ready_items.append(self._queue.get_nowait())
+                    except asyncio.QueueEmpty:
+                        break
+                if ready_items:
+                    pending = [pending[0], *ready_items, *pending[1:]]
 
             # Dispatch; overflow (texts that didn't fit in VRAM) is returned
             # and processed immediately in the next iteration without a new window wait.
             pending = await self._dispatch(pending, loop)
 
     async def _dispatch(self, batch: list[_PendingItem], loop: asyncio.AbstractEventLoop) -> list[_PendingItem]:
+        stale_count = sum(1 for item in batch if item.state.future.done())
+        if stale_count:
+            batch = [item for item in batch if not item.state.future.done()]
+            self._mark_processed(stale_count)
+        if not batch:
+            return []
+
         # Group by (task, dimensions) — in practice almost always one group.
         groups: dict[tuple, list[_PendingItem]] = defaultdict(list)
         for item in batch:
@@ -1257,37 +1400,40 @@ class ContinuousBatcher:
 
         for (task, dimensions), items in groups.items():
             # Cap this group by available VRAM; overflow is deferred to next iteration.
-            max_texts = self._runtime.estimate_max_texts()
-            to_process: list[_PendingItem] = []
-            text_count = 0
-            for item in items:
-                if to_process and text_count + len(item.texts) > max_texts:
-                    overflow.append(item)
-                else:
-                    to_process.append(item)
-                    text_count += len(item.texts)
-
-            all_texts: list[str] = []
-            offsets: list[int] = []
-            for item in to_process:
-                offsets.append(len(all_texts))
-                all_texts.extend(item.texts)
+            max_texts = max(1, self._runtime.estimate_max_texts())
+            to_process = items[:max_texts]
+            overflow.extend(items[max_texts:])
+            group_overflow = len(items) - len(to_process)
+            all_texts = [item.text for item in to_process]
+            text_count = len(all_texts)
 
             log.info(
                 "batch dispatch: requests=%d texts=%d overflow=%d task=%s dim=%s",
-                len(to_process), text_count, len(items) - len(to_process), task, dimensions,
+                len({item.request_id for item in to_process}), text_count, group_overflow, task, dimensions,
             )
-            self._stats.record_batch_dispatch(request_count=len(to_process), text_count=text_count)
+            self._stats.record_batch_dispatch(request_count=len({item.request_id for item in to_process}), text_count=text_count)
             self._stats.set_running_batch(text_count=text_count)
-            fn = functools.partial(self._runtime.encode, all_texts, dimensions=dimensions, task=task)
+            fn = functools.partial(
+                self._runtime.encode,
+                all_texts,
+                dimensions=dimensions,
+                task=task,
+                allow_batch_growth=group_overflow > 0,
+            )
             try:
                 embeddings: list[list[float]] = await loop.run_in_executor(None, fn)
-                for item, offset in zip(to_process, offsets):
-                    item.future.set_result(embeddings[offset: offset + len(item.texts)])
+                for item, embedding in zip(to_process, embeddings):
+                    state = item.state
+                    if state.future.done():
+                        continue
+                    state.embeddings[item.input_index] = embedding
+                    state.remaining -= 1
+                    if state.remaining <= 0:
+                        state.future.set_result([row or [] for row in state.embeddings])
             except Exception as exc:
                 for item in to_process:
-                    if not item.future.done():
-                        item.future.set_exception(exc)
+                    if not item.state.future.done():
+                        item.state.future.set_exception(exc)
             finally:
                 self._stats.set_running_batch(text_count=0)
                 self._mark_processed(len(to_process))
@@ -1348,10 +1494,20 @@ def _dashboard_html() -> str:
     h1 { font-size: 20px; margin: 0; }
     .muted { color: #aaa; font-size: 13px; }
     .grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin-bottom: 14px; }
-    .card { border: 1px solid #333; border-radius: 6px; padding: 10px; background: #181818; }
-    .card[title] { cursor: help; }
+    .card { border: 1px solid #333; border-radius: 6px; padding: 10px; background: #181818; position: relative; }
+    .card[data-title] { cursor: help; }
     .label { color: #aaa; font-size: 12px; }
     .value { font-size: 18px; margin-top: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .value.good { color: #8fd18f; }
+    .value.warn { color: #f1c75b; }
+    .value.bad { color: #ff8a8a; }
+    #card-tooltip {
+      position: fixed; z-index: 20; display: none; max-width: min(520px, calc(100vw - 24px));
+      padding: 9px 11px; border: 1px solid #444; border-radius: 6px;
+      background: rgba(18, 18, 18, 0.97); color: #eee; box-shadow: 0 10px 28px rgba(0,0,0,0.4);
+      font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      white-space: pre-wrap; overflow-wrap: anywhere; pointer-events: none;
+    }
     qps-chart { display: block; height: 260px; margin-bottom: 14px; }
     table { width: 100%; border-collapse: collapse; margin-top: 14px; table-layout: fixed; }
     th, td { border-bottom: 1px solid #333; padding: 7px; text-align: left; vertical-align: top; font-size: 12px; }
@@ -1368,6 +1524,7 @@ def _dashboard_html() -> str:
     <div class="muted" id="updated">loading</div>
   </header>
   <section class="grid" id="cards"></section>
+  <div id="card-tooltip" role="tooltip"></div>
   <qps-chart id="qps"></qps-chart>
   <table>
     <thead>
@@ -1385,11 +1542,48 @@ const cards = document.getElementById("cards");
 const updated = document.getElementById("updated");
 const qpsChart = document.getElementById("qps");
 const inputs = document.getElementById("inputs");
+const cardTooltip = document.getElementById("card-tooltip");
 
 function esc(value) {
   return String(value ?? "").replace(/[&<>"']/g, ch => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
   }[ch]));
+}
+
+function showCardTooltip(target, event) {
+  const title = target.dataset.title;
+  if (!title) return;
+  cardTooltip.textContent = title;
+  cardTooltip.style.display = "block";
+  positionCardTooltip(event);
+}
+
+function positionCardTooltip(event) {
+  if (cardTooltip.style.display !== "block") return;
+  const gap = 12;
+  const rect = cardTooltip.getBoundingClientRect();
+  let left = event.clientX + gap;
+  let top = event.clientY + gap;
+  if (left + rect.width > window.innerWidth - gap) {
+    left = Math.max(gap, event.clientX - rect.width - gap);
+  }
+  if (top + rect.height > window.innerHeight - gap) {
+    top = Math.max(gap, event.clientY - rect.height - gap);
+  }
+  cardTooltip.style.left = `${left}px`;
+  cardTooltip.style.top = `${top}px`;
+}
+
+function hideCardTooltip() {
+  cardTooltip.style.display = "none";
+}
+
+function durationTone(durationMs) {
+  const value = Number(durationMs);
+  if (!Number.isFinite(value)) return "";
+  if (value < 250) return "good";
+  if (value < 1000) return "warn";
+  return "bad";
 }
 
 class QpsChart extends HTMLElement {
@@ -1539,6 +1733,18 @@ class QpsChart extends HTMLElement {
 
 customElements.define("qps-chart", QpsChart);
 
+cards.addEventListener("mouseover", event => {
+  const card = event.target.closest(".card[data-title]");
+  if (!card || !cards.contains(card)) return;
+  showCardTooltip(card, event);
+});
+cards.addEventListener("mousemove", positionCardTooltip);
+cards.addEventListener("mouseout", event => {
+  const card = event.target.closest(".card[data-title]");
+  if (!card || card.contains(event.relatedTarget)) return;
+  hideCardTooltip();
+});
+
 async function apiJson(url) {
   const response = await fetch(url);
   if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
@@ -1562,17 +1768,28 @@ async function refresh() {
     { label: "device", value: r.loaded_device },
     { label: "precision", value: r.precision ?? "-" },
     { label: "worker pid", value: r.worker_pid ?? "-" },
+    { label: "request texts", value: s.last_request_texts ?? "-" },
+    { label: "batch size", value: s.last_batch_texts ?? "-" },
     {
-      label: "batch size / batch target",
-      value: `${r.adaptive_batch?.last_batch_texts ?? "-"} / ${r.adaptive_batch?.current_target ?? "-"}`
+      label: "batch target",
+      value: r.effective_batch_target ?? "-"
     },
-    { label: "last duration", value: `${s.last_duration_ms ?? "-"} ms` },
-    { label: "errors", value: s.requests_failed, title: lastError }
+    {
+      label: "last duration",
+      value: `${s.last_duration_ms ?? "-"} ms`,
+      tone: durationTone(s.last_duration_ms)
+    },
+    {
+      label: "errors",
+      value: s.requests_failed,
+      tone: Number(s.requests_failed || 0) > 0 ? "bad" : "",
+      title: lastError
+    }
   ];
   cards.innerHTML = cardRows.map(item => `
-    <div class="card"${item.title ? ` title="${esc(item.title)}"` : ""}>
+    <div class="card"${item.title ? ` data-title="${esc(item.title)}"` : ""}>
       <div class="label">${esc(item.label)}</div>
-      <div class="value">${esc(item.value)}</div>
+      <div class="value${item.tone ? ` ${esc(item.tone)}` : ""}">${esc(item.value)}</div>
     </div>
   `).join("");
   qpsChart.setData(metrics.buckets);
@@ -1601,6 +1818,7 @@ def create_app(settings: Settings | None = None, runtime: EmbedderRuntime | None
     request_log = RequestLogBuffer(max_inputs=10_000, max_requests=10_000)
     resolved_runtime.attach_stats(stats)
     batcher = ContinuousBatcher(resolved_runtime, stats=stats, window_secs=resolved_settings.batch_window_ms / 1000)
+    input_length_validator = InputLengthValidator(resolved_settings)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -1761,6 +1979,31 @@ def create_app(settings: Settings | None = None, runtime: EmbedderRuntime | None
         )
         stats.record_request_start(request_id=request_id, text_count=len(texts))
         started_at = time.perf_counter()
+        try:
+            input_length_validator.validate(texts)
+        except HTTPException as exc:
+            duration_ms = (time.perf_counter() - started_at) * 1000
+            error_summary = f"HTTPException: {exc.detail}"
+            stats.record_request_failure(
+                request_id=request_id,
+                duration_ms=duration_ms,
+                error_summary=error_summary,
+            )
+            request_log.record_finish(
+                request_id=request_id,
+                status_code=exc.status_code,
+                duration_ms=duration_ms,
+                error_summary=error_summary,
+            )
+            log.warning(
+                "embedding request rejected request_id=%s texts=%d duration_ms=%.1f error=%s",
+                request_id,
+                len(texts),
+                duration_ms,
+                error_summary,
+            )
+            exc.headers = {**(exc.headers or {}), "X-Request-Id": request_id}
+            raise
         log.info(
             "embedding request started request_id=%s texts=%d dimensions=%s task=%s",
             request_id,
