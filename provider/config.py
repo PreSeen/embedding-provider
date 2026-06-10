@@ -18,6 +18,10 @@ def _env_int(name: str, default: str | None = None) -> int | None:
     return int(value)
 
 
+def _env_float(name: str, default: str) -> float:
+    return float(os.getenv(name, default))
+
+
 @dataclass(frozen=True)
 class Settings:
     service_name: str
@@ -41,6 +45,11 @@ class Settings:
     gpu_to_cpu_scale_down_seconds: float
     start_device: str
     cuda_visible_devices: str | None
+    request_log_limit: int = 100_000
+    embedding_cache_limit: int = 100_000
+    cuda_batch_growth_factor: int = 2
+    cuda_vram_safety_fixed_mb: int = 512
+    cuda_vram_safety_total_ratio: float = 0.05
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -66,4 +75,9 @@ class Settings:
             gpu_to_cpu_scale_down_seconds=float(os.getenv("GPU_TO_CPU_SCALE_DOWN_SECONDS", "30")),
             start_device=os.getenv("START_DEVICE", "auto").strip().lower(),
             cuda_visible_devices=os.getenv("CUDA_VISIBLE_DEVICES") or None,
+            request_log_limit=_env_int("REQUEST_LOG_LIMIT", "100000") or 100_000,
+            embedding_cache_limit=_env_int("EMBEDDING_CACHE_LIMIT", "100000") or 100_000,
+            cuda_batch_growth_factor=_env_int("CUDA_BATCH_GROWTH_FACTOR", "2") or 2,
+            cuda_vram_safety_fixed_mb=_env_int("CUDA_VRAM_SAFETY_FIXED_MB", "512") or 512,
+            cuda_vram_safety_total_ratio=_env_float("CUDA_VRAM_SAFETY_TOTAL_RATIO", "0.05"),
         )

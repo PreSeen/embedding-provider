@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import sys
 import types
+import os
 from dataclasses import dataclass
 from typing import Any
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
@@ -83,7 +85,7 @@ if "transformers" not in sys.modules:
     fake_transformers.AutoTokenizer = _FakeAutoTokenizer
     sys.modules["transformers"] = fake_transformers
 
-from provider.app import AdaptiveBatchState, EmbeddingResultCache, RequestLogBuffer, _country_for_ip, create_app
+from provider.app import AdaptiveBatchState, EmbeddingResultCache, InputLengthValidator, RequestLogBuffer, _country_for_ip, create_app
 from provider.config import Settings
 
 
@@ -236,30 +238,22 @@ def test_embeddings_failure_updates_error_stats_and_preserves_request_id() -> No
         assert "ValueError" in str(stats["last_error_summary"])
 
 
-def test_embeddings_rejects_inputs_over_configured_token_limit() -> None:
-    app = create_app(settings=_settings(), runtime=FakeRuntime())
-    with TestClient(app, raise_server_exceptions=False) as client:
-        response = client.post(
-            "/v1/embeddings",
-            headers={
-                "Authorization": "Bearer test-key",
-                "X-Request-Id": "embed-req-long",
-            },
-            json={
-                "model": "jinaai/jina-embeddings-v5-text-nano",
-                "input": " ".join(f"tok-{idx}" for idx in range(300)),
-            },
-        )
+def test_input_length_validator_truncates_inputs_over_configured_token_limit_with_warning() -> None:
+    validator = InputLengthValidator(_settings())
+    texts = ["short input", " ".join(f"tok-{idx}" for idx in range(300))]
 
-        assert response.status_code == 400
-        assert response.headers["X-Request-Id"] == "embed-req-long"
-        assert "exceeds MAX_LENGTH=256" in response.json()["detail"]
+    truncated, warnings, counts = validator.truncate_over_limit(texts)
 
-        stats = client.get("/statsz").json()["stats"]
-        assert stats["requests_total"] == 1
-        assert stats["requests_failed"] == 1
-        assert stats["last_error_request_id"] == "embed-req-long"
-        assert "exceeds MAX_LENGTH=256" in str(stats["last_error_summary"])
+    assert truncated[0] == texts[0]
+    assert counts[0] <= 256
+    assert counts[1] > 256
+    assert len(warnings) == 1
+    assert warnings[0].input_index == 1
+    assert warnings[0].max_length == 256
+    assert warnings[0].token_count == counts[1]
+    assert warnings[0].truncated_token_count <= 256
+    assert "truncated" in warnings[0].message
+    assert validator.token_counts([truncated[1]])[0] <= 256
 
 
 def test_adaptive_batch_state_grows_conservatively_after_full_dispatches() -> None:
@@ -314,6 +308,26 @@ def test_adaptive_batch_state_caps_growth_after_oom_backoff() -> None:
 
     state.record_successful_dispatch(text_count=32, vram_cap=64, allow_growth=True)
     assert state.current_target == 16
+
+
+def test_settings_reads_runtime_tuning_from_env() -> None:
+    with patch.dict(
+        os.environ,
+        {
+            "REQUEST_LOG_LIMIT": "1234",
+            "EMBEDDING_CACHE_LIMIT": "2345",
+            "CUDA_BATCH_GROWTH_FACTOR": "3",
+            "CUDA_VRAM_SAFETY_FIXED_MB": "256",
+            "CUDA_VRAM_SAFETY_TOTAL_RATIO": "0.1",
+        },
+    ):
+        settings = Settings.from_env()
+
+    assert settings.request_log_limit == 1234
+    assert settings.embedding_cache_limit == 2345
+    assert settings.cuda_batch_growth_factor == 3
+    assert settings.cuda_vram_safety_fixed_mb == 256
+    assert settings.cuda_vram_safety_total_ratio == 0.1
 
 
 def test_request_log_buffer_keeps_recent_inputs_and_qps_buckets() -> None:

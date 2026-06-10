@@ -89,8 +89,11 @@ curl http://127.0.0.1:8000/statsz
   - `MAX_LENGTH=8192`
   - `MAX_BATCH_SIZE=64`
   - `CPU_BATCH_TARGET=8`
+  - `START_DEVICE=cpu`
   - `DEFAULT_DIMENSIONS=768`
   - `IDLE_OFFLOAD_SECONDS=1800`
+  - `REQUEST_LOG_LIMIT=100000`
+  - `EMBEDDING_CACHE_LIMIT=100000`
 
 ## Idle GPU Offload
 
@@ -98,6 +101,16 @@ On CUDA hosts, the provider now keeps the HTTP process alive but moves the loade
 
 - `IDLE_OFFLOAD_SECONDS`: how long the service may stay idle before the GPU worker is terminated
 - `IDLE_OFFLOAD_POLL_SECONDS`: how often the background monitor checks whether idle termination should run
+- `START_DEVICE`: startup device policy, usually `cpu`, `cuda`, or `auto`
+- `CPU_BATCH_TARGET`: normal CPU queue-drain batch target
+- `CPU_TO_GPU_SCALE_UP_TEXTS`: queued/requested text count threshold that promotes CPU to CUDA
+- `GPU_TO_CPU_SCALE_DOWN_TEXTS`: sustained small CUDA batch threshold used for scale-down
+- `GPU_TO_CPU_SCALE_DOWN_SECONDS`: how long small CUDA batches must persist before CPU scale-down
+- `REQUEST_LOG_LIMIT`: in-memory request/input log retention limit
+- `EMBEDDING_CACHE_LIMIT`: in-memory exact-match embedding cache entry limit
+- `CUDA_BATCH_GROWTH_FACTOR`: multiplier used when CUDA target grows after full successful dispatches
+- `CUDA_VRAM_SAFETY_FIXED_MB`: fixed CUDA free-VRAM safety headroom
+- `CUDA_VRAM_SAFETY_TOTAL_RATIO`: proportional CUDA total-VRAM safety headroom
 
 When idle offload is enabled:
 

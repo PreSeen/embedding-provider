@@ -32,7 +32,9 @@ if [[ -n "${HF_CACHE_DIR:-}" ]]; then
   export HUGGINGFACE_HUB_CACHE="$HF_HOME/hub"
 fi
 
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+  export CUDA_VISIBLE_DEVICES
+fi
 
 exec "$ROOT_DIR/.venv/bin/uvicorn" provider.app:app \
   --app-dir "$ROOT_DIR" \

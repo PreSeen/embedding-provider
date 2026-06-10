@@ -31,11 +31,7 @@ from provider.config import Settings
 log = logging.getLogger("embedding_provider")
 logging.basicConfig(level="INFO")
 
-_CUDA_VRAM_SAFETY_FIXED_BYTES = 512 * 1024 * 1024
-_CUDA_VRAM_SAFETY_TOTAL_RATIO = 0.05
-_CUDA_BATCH_GROWTH_FACTOR = 2
-_IN_MEMORY_RECORD_LIMIT = 100_000
-_EMBEDDING_CACHE_LIMIT = 100_000
+_BYTES_PER_MIB = 1024 * 1024
 
 
 def _batched(values: list[str], batch_size: int) -> list[list[str]]:
@@ -245,10 +241,12 @@ class ProviderRuntimeStats:
 
 
 class RequestLogBuffer:
-    def __init__(self, *, max_inputs: int = _IN_MEMORY_RECORD_LIMIT, max_requests: int = _IN_MEMORY_RECORD_LIMIT) -> None:
+    def __init__(self, *, max_inputs: int, max_requests: int) -> None:
+        self._max_inputs = max(1, int(max_inputs))
+        self._max_requests = max(1, int(max_requests))
         self._lock = threading.Lock()
-        self._inputs: deque[dict[str, Any]] = deque(maxlen=max_inputs)
-        self._requests: deque[dict[str, Any]] = deque(maxlen=max_requests)
+        self._inputs: deque[dict[str, Any]] = deque(maxlen=self._max_inputs)
+        self._requests: deque[dict[str, Any]] = deque(maxlen=self._max_requests)
         self._request_index: dict[str, dict[str, Any]] = {}
 
     def record_start(
@@ -322,12 +320,12 @@ class RequestLogBuffer:
             entry["error_summary"] = error_summary
 
     def recent_inputs(self, *, limit: int = 200) -> list[dict[str, Any]]:
-        safe_limit = max(1, min(_IN_MEMORY_RECORD_LIMIT, int(limit)))
+        safe_limit = max(1, min(self._max_inputs, int(limit)))
         with self._lock:
             return list(self._inputs)[-safe_limit:][::-1]
 
     def recent_requests(self, *, limit: int = 200) -> list[dict[str, Any]]:
-        safe_limit = max(1, min(_IN_MEMORY_RECORD_LIMIT, int(limit)))
+        safe_limit = max(1, min(self._max_requests, int(limit)))
         with self._lock:
             return [dict(item) for item in list(self._requests)[-safe_limit:][::-1]]
 
@@ -398,7 +396,7 @@ EmbeddingCacheKey = tuple[str, int | None, str | None, str]
 
 
 class EmbeddingResultCache:
-    def __init__(self, *, max_entries: int = _EMBEDDING_CACHE_LIMIT) -> None:
+    def __init__(self, *, max_entries: int) -> None:
         self._max_entries = max(0, int(max_entries))
         self._items: OrderedDict[EmbeddingCacheKey, tuple[float, ...]] = OrderedDict()
         self._lock = threading.Lock()
@@ -450,10 +448,11 @@ class AdaptiveBatchState:
     _DEFAULT_MAX_TARGET = 64
     _MIN_TARGET = 1
 
-    def __init__(self, configured_max_batch_size: int | None) -> None:
+    def __init__(self, configured_max_batch_size: int | None, *, growth_factor: int = 2) -> None:
         configured_cap = configured_max_batch_size or self._DEFAULT_MAX_TARGET
         self._hard_cap = max(1, int(configured_cap))
         self._initial_target = min(self._MIN_TARGET, self._hard_cap)
+        self._growth_factor = max(1, int(growth_factor))
         self._current_target = self._initial_target
         self._last_batch_texts = 0
         self._last_vram_cap: int | None = None
@@ -484,7 +483,7 @@ class AdaptiveBatchState:
             self._last_vram_cap = vram_cap if vram_cap is None else max(1, int(vram_cap))
             if not allow_growth or self._last_batch_texts < self._current_target:
                 return
-            next_target = min(self._hard_cap, max(1, self._current_target * _CUDA_BATCH_GROWTH_FACTOR))
+            next_target = min(self._hard_cap, max(1, self._current_target * self._growth_factor))
             if self._last_vram_cap is not None:
                 next_target = min(next_target, self._last_vram_cap)
             if self._oom_target_ceiling is not None:
@@ -544,11 +543,20 @@ class EmbeddingUsage(BaseModel):
     total_tokens: int = 0
 
 
+class EmbeddingWarning(BaseModel):
+    input_index: int
+    token_count: int
+    max_length: int
+    truncated_token_count: int
+    message: str
+
+
 class EmbeddingResponse(BaseModel):
     object: Literal["list"] = "list"
     data: list[EmbeddingItem]
     model: str
     usage: EmbeddingUsage = Field(default_factory=EmbeddingUsage)
+    warnings: list[EmbeddingWarning] = Field(default_factory=list)
 
 
 class DeviceSwitchRequest(BaseModel):
@@ -594,6 +602,49 @@ class InputLengthValidator:
                     ),
                 )
         return counts
+
+    def truncate_over_limit(self, texts: list[str]) -> tuple[list[str], list[EmbeddingWarning], list[int]]:
+        max_length = self.max_length
+        if not max_length:
+            return texts, [], []
+        counts = self.token_counts(texts)
+        truncated = list(texts)
+        warnings: list[EmbeddingWarning] = []
+        for index, count in enumerate(counts):
+            if count <= max_length:
+                continue
+            truncated_text, truncated_count = self._truncate_text_to_token_limit(texts[index], max_length)
+            truncated[index] = truncated_text
+            warnings.append(
+                EmbeddingWarning(
+                    input_index=index,
+                    token_count=count,
+                    max_length=max_length,
+                    truncated_token_count=truncated_count,
+                    message=(
+                        f"input[{index}] exceeded MAX_LENGTH={max_length}: "
+                        f"{count} tokens; truncated to {truncated_count} tokens before embedding"
+                    ),
+                )
+            )
+        return truncated, warnings, counts
+
+    def _truncate_text_to_token_limit(self, text: str, max_length: int) -> tuple[str, int]:
+        low = 0
+        high = len(text)
+        best_text = ""
+        best_count = self.token_counts([""])[0]
+        while low <= high:
+            mid = (low + high) // 2
+            candidate = text[:mid].rstrip()
+            count = self.token_counts([candidate])[0]
+            if count <= max_length:
+                best_text = candidate
+                best_count = count
+                low = mid + 1
+            else:
+                high = mid - 1
+        return best_text, best_count
 
     def _get_tokenizer(self) -> Any:
         with self._lock:
@@ -754,7 +805,10 @@ class EmbedderRuntime:
         self._bytes_per_text_ema: float | None = None
         self._ema_alpha = 0.25
         self._input_length_validator = InputLengthValidator(settings)
-        self.adaptive_batch = AdaptiveBatchState(settings.max_batch_size)
+        self.adaptive_batch = AdaptiveBatchState(
+            settings.max_batch_size,
+            growth_factor=settings.cuda_batch_growth_factor,
+        )
         self._engine_state = "offloaded" if self._use_gpu_worker else "hot"
         self._reload_in_progress = False
         self._inflight_encodes = 0
@@ -1344,7 +1398,10 @@ class EmbedderRuntime:
         free, total = _probe_cuda_memory_bytes()
         if free is None or total is None:
             return hard_cap or 256
-        safety = _CUDA_VRAM_SAFETY_FIXED_BYTES + int(total * _CUDA_VRAM_SAFETY_TOTAL_RATIO)
+        safety = (
+            self._settings.cuda_vram_safety_fixed_mb * _BYTES_PER_MIB
+            + int(total * self._settings.cuda_vram_safety_total_ratio)
+        )
         usable = free - safety
         if usable <= 0 or self._bytes_per_text_ema is None or self._bytes_per_text_ema <= 0:
             estimate = 1
@@ -1584,11 +1641,25 @@ def _dashboard_html() -> str:
     header { display: flex; gap: 16px; align-items: baseline; margin-bottom: 14px; }
     h1 { font-size: 20px; margin: 0; }
     .muted { color: #aaa; font-size: 13px; }
-    .grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin-bottom: 14px; }
-    .card { border: 1px solid #333; border-radius: 6px; padding: 10px; background: #181818; position: relative; }
+    .grid {
+      display: flex; flex-wrap: nowrap; gap: 8px; margin-bottom: 14px;
+      overflow-x: auto; overflow-y: hidden; padding-bottom: 2px;
+      scrollbar-width: thin;
+    }
+    .card {
+      flex: 1 0 86px; min-width: 86px; max-width: 150px;
+      border: 1px solid #333; border-radius: 6px; padding: 7px 8px;
+      background: #181818; position: relative;
+    }
     .card[data-title] { cursor: help; }
-    .label { color: #aaa; font-size: 12px; }
-    .value { font-size: 18px; margin-top: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .label {
+      color: #aaa; font-size: 11px; overflow: hidden; text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .value {
+      font-size: 15px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      margin-top: 2px;
+    }
     .value.good { color: #8fd18f; }
     .value.warn { color: #f1c75b; }
     .value.bad { color: #ff8a8a; }
@@ -1887,15 +1958,9 @@ async function refresh() {
     { label: "inflight / queue", value: `${r.inflight_encodes} / ${s.queue_depth}` },
     { label: "device", value: r.loaded_device },
     { label: "precision", value: r.precision ?? "-" },
-    { label: "worker pid", value: r.worker_pid ?? "-" },
-    { label: "cache entries", value: `${c.entries ?? 0} / ${c.max_entries ?? "-"}` },
     { label: "cache hit rate", value: `${((Number(c.hit_rate || 0)) * 100).toFixed(1)}%` },
     { label: "request texts", value: s.last_request_texts ?? "-" },
-    { label: "batch size", value: s.last_batch_texts ?? "-" },
-    {
-      label: "batch target",
-      value: r.effective_batch_target ?? "-"
-    },
+    { label: "batch size / target", value: `${s.last_batch_texts ?? "-"} / ${r.effective_batch_target ?? "-"}` },
     {
       label: "last duration",
       value: `${s.last_duration_ms ?? "-"} ms`,
@@ -1937,8 +2002,11 @@ def create_app(settings: Settings | None = None, runtime: EmbedderRuntime | None
     resolved_settings = settings or Settings.from_env()
     resolved_runtime = runtime or EmbedderRuntime(resolved_settings)
     stats = ProviderRuntimeStats()
-    request_log = RequestLogBuffer(max_inputs=_IN_MEMORY_RECORD_LIMIT, max_requests=_IN_MEMORY_RECORD_LIMIT)
-    embedding_cache = EmbeddingResultCache(max_entries=_EMBEDDING_CACHE_LIMIT)
+    request_log = RequestLogBuffer(
+        max_inputs=resolved_settings.request_log_limit,
+        max_requests=resolved_settings.request_log_limit,
+    )
+    embedding_cache = EmbeddingResultCache(max_entries=resolved_settings.embedding_cache_limit)
     resolved_runtime.attach_stats(stats)
     batcher = ContinuousBatcher(resolved_runtime, stats=stats, window_secs=resolved_settings.batch_window_ms / 1000)
     input_length_validator = InputLengthValidator(resolved_settings)
@@ -2108,31 +2176,19 @@ def create_app(settings: Settings | None = None, runtime: EmbedderRuntime | None
         )
         stats.record_request_start(request_id=request_id, text_count=len(texts))
         started_at = time.perf_counter()
-        try:
-            input_length_validator.validate(texts)
-        except HTTPException as exc:
-            duration_ms = (time.perf_counter() - started_at) * 1000
-            error_summary = f"HTTPException: {exc.detail}"
-            stats.record_request_failure(
-                request_id=request_id,
-                duration_ms=duration_ms,
-                error_summary=error_summary,
-            )
-            request_log.record_finish(
-                request_id=request_id,
-                status_code=exc.status_code,
-                duration_ms=duration_ms,
-                error_summary=error_summary,
-            )
+        texts_for_embedding, input_warnings, _token_counts = input_length_validator.truncate_over_limit(texts)
+        usage_token_count = (
+            sum(input_length_validator.token_counts(texts_for_embedding))
+            if input_length_validator.max_length
+            else _estimate_tokens(texts_for_embedding)
+        )
+        if input_warnings:
             log.warning(
-                "embedding request rejected request_id=%s texts=%d duration_ms=%.1f error=%s",
+                "embedding request inputs truncated request_id=%s texts=%d warnings=%s",
                 request_id,
                 len(texts),
-                duration_ms,
-                error_summary,
+                [warning.dict() for warning in input_warnings],
             )
-            exc.headers = {**(exc.headers or {}), "X-Request-Id": request_id}
-            raise
         log.info(
             "embedding request started request_id=%s texts=%d dimensions=%s task=%s",
             request_id,
@@ -2144,13 +2200,13 @@ def create_app(settings: Settings | None = None, runtime: EmbedderRuntime | None
         effective_task = request.task or resolved_settings.embedding_task
         cache_keys: list[EmbeddingCacheKey] = [
             (resolved_settings.model_id, effective_dimensions, effective_task, text)
-            for text in texts
+            for text in texts_for_embedding
         ]
         cached_embeddings = embedding_cache.get_many(cache_keys)
         miss_indices = [idx for idx, embedding in enumerate(cached_embeddings) if embedding is None]
         try:
             if miss_indices:
-                miss_texts = [texts[idx] for idx in miss_indices]
+                miss_texts = [texts_for_embedding[idx] for idx in miss_indices]
                 miss_embeddings = await batcher.encode(
                     miss_texts,
                     dimensions=request.dimensions,
@@ -2233,9 +2289,10 @@ def create_app(settings: Settings | None = None, runtime: EmbedderRuntime | None
             data=[EmbeddingItem(index=idx, embedding=embedding) for idx, embedding in enumerate(embeddings)],
             model=resolved_settings.model_alias or resolved_settings.model_id,
             usage=EmbeddingUsage(
-                prompt_tokens=_estimate_tokens(texts),
-                total_tokens=_estimate_tokens(texts),
+                prompt_tokens=usage_token_count,
+                total_tokens=usage_token_count,
             ),
+            warnings=input_warnings,
         )
 
     return app
