@@ -101,6 +101,7 @@ On CUDA hosts, the provider now keeps the HTTP process alive but moves the loade
 
 - `IDLE_OFFLOAD_SECONDS`: how long the service may stay idle before the GPU worker is terminated
 - `IDLE_OFFLOAD_POLL_SECONDS`: how often the background monitor checks whether idle termination should run
+- `DEVICE_SWITCH_MIN_SECONDS`: minimum interval between automatic CPU/CUDA device switches
 - `START_DEVICE`: startup device policy, usually `cpu`, `cuda`, or `auto`
 - `CPU_BATCH_TARGET`: normal CPU queue-drain batch target
 - `CPU_TO_GPU_SCALE_UP_TEXTS`: queued/requested text count threshold that promotes CPU to CUDA
@@ -109,8 +110,10 @@ On CUDA hosts, the provider now keeps the HTTP process alive but moves the loade
 - `REQUEST_LOG_LIMIT`: in-memory request/input log retention limit
 - `EMBEDDING_CACHE_LIMIT`: in-memory exact-match embedding cache entry limit
 - `CUDA_BATCH_GROWTH_FACTOR`: multiplier used when CUDA target grows after full successful dispatches
+- `CUDA_BATCH_DEMAND_EMA_ALPHA`: smoothing factor for lowering CUDA target toward recent average queue demand
 - `CUDA_VRAM_SAFETY_FIXED_MB`: fixed CUDA free-VRAM safety headroom
 - `CUDA_VRAM_SAFETY_TOTAL_RATIO`: proportional CUDA total-VRAM safety headroom
+- `GPU_FORWARD_CONCURRENCY`: maximum simultaneous forwards inside the one CUDA worker; defaults to `1`
 
 When idle offload is enabled:
 
@@ -121,6 +124,21 @@ When idle offload is enabled:
 - `/statsz` exposes request counters, queue depth, last error summary, and reload/offload counters
 
 This only affects the embedding-provider process itself. It does not touch the OCR service, system CUDA, or other GPU workloads on the host.
+
+## GPU Forward Concurrency
+
+CPU inference always stays serial because parallel CPU forwards compete for the same cores without improving useful throughput. CUDA can use bounded concurrent forwards when `GPU_FORWARD_CONCURRENCY` is greater than `1`: the central batcher splits only the current adaptive text budget across lanes, the parent correlates out-of-order worker responses by request ID, and the child retains one model copy. `/statsz` reports `gpu_forward_concurrency_configured`, `gpu_forward_concurrency_effective`, `gpu_forwards_in_flight`, and `gpu_forward_peak_in_flight`.
+
+Keep the generic default at `1`. Benchmark `jina-v5-small` candidates in an isolated local instance before changing its production env:
+
+```bash
+.venv/bin/python scripts/benchmark_gpu_forward_concurrency.py \
+  --env-file deployments/gpu4/jina-v5-small.env \
+  --candidates 1,2,4 \
+  --output docs/benchmarks/jina-v5-small-gpu-forward-concurrency.md
+```
+
+The benchmark never prints the API key and requires at least 10% aggregate throughput improvement, no workload P95 regression above 10%, no errors/OOM, safe VRAM, and successful worker offload.
 
 ## VRAM-Aware Batching
 

@@ -3,10 +3,18 @@ from __future__ import annotations
 import sys
 import types
 import os
+import asyncio
+import json
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
+from pathlib import Path
 from dataclasses import dataclass
 from typing import Any
 from unittest.mock import patch
 
+import pytest
 from fastapi.testclient import TestClient
 
 if "torch" not in sys.modules:
@@ -85,7 +93,19 @@ if "transformers" not in sys.modules:
     fake_transformers.AutoTokenizer = _FakeAutoTokenizer
     sys.modules["transformers"] = fake_transformers
 
-from provider.app import AdaptiveBatchState, EmbeddingResultCache, InputLengthValidator, RequestLogBuffer, _country_for_ip, create_app
+from provider.app import (
+    AdaptiveBatchState,
+    ContinuousBatcher,
+    EmbeddingResultCache,
+    InputLengthValidator,
+    RequestLogBuffer,
+    ProviderRuntimeStats,
+    _GpuEmbedderWorker,
+    _PendingItem,
+    _PendingRequestState,
+    _country_for_ip,
+    create_app,
+)
 from provider.config import Settings
 
 
@@ -118,7 +138,14 @@ class FakeRuntime:
             "worker_pid": None,
         }
 
-    def encode(self, texts: list[str], *, dimensions: int | None = None, task: str | None = None) -> list[list[float]]:
+    def encode(
+        self,
+        texts: list[str],
+        *,
+        dimensions: int | None = None,
+        task: str | None = None,
+        allow_batch_growth: bool = False,
+    ) -> list[list[float]]:
         if self.fail_with is not None:
             raise self.fail_with
         self.seen_batches.append(len(texts))
@@ -149,6 +176,7 @@ def _settings() -> Settings:
         batch_window_ms=1,
         idle_offload_seconds=0,
         idle_offload_poll_seconds=0,
+        device_switch_min_seconds=0,
         cpu_batch_target=8,
         cpu_to_gpu_scale_up_texts=8,
         gpu_to_cpu_scale_down_texts=2,
@@ -213,6 +241,79 @@ def test_embeddings_request_echoes_request_id_and_updates_success_stats() -> Non
         assert stats["last_success_request_id"] == "embed-req-1"
 
 
+@pytest.mark.parametrize(
+    ("device", "expected_batches", "expected_peak"),
+    [
+        ("cuda", [2, 2, 2], 3),
+        ("cpu", [6], 1),
+    ],
+)
+def test_continuous_batcher_only_parallelizes_gpu_forwards(
+    device: str,
+    expected_batches: list[int],
+    expected_peak: int,
+) -> None:
+    class MeasuringRuntime(FakeRuntime):
+        def __post_init__(self) -> None:
+            super().__post_init__()
+            self.device_name = device
+            self._preferred_device = device
+            self._concurrency_lock = threading.Lock()
+            self._in_flight = 0
+            self.peak_in_flight = 0
+            self.adaptive_batch = types.SimpleNamespace(record_observed_demand=lambda **_kwargs: None)
+
+        def effective_gpu_forward_concurrency(self) -> int:
+            return 3 if self.device_name == "cuda" else 1
+
+        def encode(self, texts: list[str], **kwargs: Any) -> list[list[float]]:
+            with self._concurrency_lock:
+                self._in_flight += 1
+                self.peak_in_flight = max(self.peak_in_flight, self._in_flight)
+            try:
+                time.sleep(0.05)
+                self.seen_batches.append(len(texts))
+                return [[float(text)] for text in texts]
+            finally:
+                with self._concurrency_lock:
+                    self._in_flight -= 1
+
+    runtime = MeasuringRuntime(estimate_max_texts_value=6)
+    settings = replace(_settings(), gpu_forward_concurrency=3, max_batch_size=6)
+    async def run_batch() -> list[list[float]]:
+        batcher = ContinuousBatcher(runtime, ProviderRuntimeStats(), window_secs=0.001)
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[list[list[float]]] = loop.create_future()
+        state = _PendingRequestState(future=future, embeddings=[None] * 6, remaining=6)
+        now = time.monotonic()
+        items = [
+            _PendingItem(
+                text=text,
+                input_index=index,
+                dimensions=1,
+                task=None,
+                state=state,
+                enqueued_at=now,
+                request_id="concurrency-test",
+            )
+            for index, text in enumerate(["1", "2", "3", "4", "5", "6"])
+        ]
+        await batcher._dispatch(items, loop, observe_demand=True)
+        return await future
+
+    embeddings = asyncio.run(run_batch())
+    assert sorted(runtime.seen_batches) == expected_batches
+    assert runtime.peak_in_flight == expected_peak
+    assert embeddings == [
+        [1.0],
+        [2.0],
+        [3.0],
+        [4.0],
+        [5.0],
+        [6.0],
+    ]
+
+
 def test_embeddings_failure_updates_error_stats_and_preserves_request_id() -> None:
     app = create_app(settings=_settings(), runtime=FakeRuntime(fail_with=ValueError("bad dims")))
     with TestClient(app, raise_server_exceptions=False) as client:
@@ -271,20 +372,49 @@ def test_adaptive_batch_state_grows_conservatively_after_full_dispatches() -> No
     assert state.current_target == 4
 
 
-def test_adaptive_batch_state_keeps_target_stable_until_reset() -> None:
-    state = AdaptiveBatchState(configured_max_batch_size=64)
+def test_adaptive_batch_state_decays_toward_queue_demand_ema() -> None:
+    state = AdaptiveBatchState(configured_max_batch_size=64, demand_ema_alpha=0.5)
     state.record_successful_dispatch(text_count=1, vram_cap=64, allow_growth=True)
     state.record_successful_dispatch(text_count=2, vram_cap=64, allow_growth=True)
     state.record_successful_dispatch(text_count=4, vram_cap=64, allow_growth=True)
+    state.record_successful_dispatch(text_count=8, vram_cap=64, allow_growth=True)
+    state.record_successful_dispatch(text_count=16, vram_cap=64, allow_growth=True)
+    state.record_successful_dispatch(text_count=32, vram_cap=64, allow_growth=True)
+
+    assert state.current_target == 64
+
+    state.record_observed_demand(text_count=64)
+    assert state.current_target == 64
+
+    state.record_observed_demand(text_count=8)
+    assert state.current_target == 64
+
+    state.record_observed_demand(text_count=8)
+    assert state.current_target == 32
+
+    for _ in range(5):
+        state.record_observed_demand(text_count=8)
 
     assert state.current_target == 8
-
-    state.record_successful_dispatch(text_count=2, vram_cap=64, allow_growth=False)
-    assert state.current_target == 8
+    assert state.snapshot()["last_observed_demand"] == 8
+    assert state.snapshot()["demand_ema"] is not None
 
     state.reset()
     assert state.current_target == 1
     assert state.snapshot()["last_batch_texts"] == 0
+    assert state.snapshot()["demand_ema"] is None
+
+
+def test_adaptive_batch_state_uses_backlog_ema_not_tail_chunk_size() -> None:
+    state = AdaptiveBatchState(configured_max_batch_size=64, demand_ema_alpha=0.5)
+    for text_count in [1, 2, 4, 8, 16, 32]:
+        state.record_successful_dispatch(text_count=text_count, vram_cap=64, allow_growth=True)
+
+    assert state.current_target == 64
+
+    state.record_observed_demand(text_count=64)
+    state.record_successful_dispatch(text_count=2, vram_cap=64, allow_growth=False)
+    assert state.current_target == 64
 
 
 def test_adaptive_batch_state_caps_growth_after_oom_backoff() -> None:
@@ -316,18 +446,131 @@ def test_settings_reads_runtime_tuning_from_env() -> None:
         {
             "REQUEST_LOG_LIMIT": "1234",
             "EMBEDDING_CACHE_LIMIT": "2345",
+            "DEVICE_SWITCH_MIN_SECONDS": "45",
             "CUDA_BATCH_GROWTH_FACTOR": "3",
+            "CUDA_BATCH_DEMAND_EMA_ALPHA": "0.25",
             "CUDA_VRAM_SAFETY_FIXED_MB": "256",
             "CUDA_VRAM_SAFETY_TOTAL_RATIO": "0.1",
+            "GPU_FORWARD_CONCURRENCY": "3",
         },
     ):
         settings = Settings.from_env()
 
     assert settings.request_log_limit == 1234
     assert settings.embedding_cache_limit == 2345
+    assert settings.device_switch_min_seconds == 45.0
     assert settings.cuda_batch_growth_factor == 3
+    assert settings.cuda_batch_demand_ema_alpha == 0.25
     assert settings.cuda_vram_safety_fixed_mb == 256
     assert settings.cuda_vram_safety_total_ratio == 0.1
+    assert settings.gpu_forward_concurrency == 3
+
+
+def test_gpu_forward_concurrency_defaults_to_one() -> None:
+    with patch.dict(os.environ, {}, clear=True):
+        settings = Settings.from_env()
+
+    assert settings.gpu_forward_concurrency == 1
+
+
+@pytest.mark.parametrize("value", ["0", "-1"])
+def test_gpu_forward_concurrency_must_be_positive(value: str) -> None:
+    with patch.dict(os.environ, {"GPU_FORWARD_CONCURRENCY": value}, clear=True):
+        with pytest.raises(ValueError, match="GPU_FORWARD_CONCURRENCY"):
+            Settings.from_env()
+
+
+def test_gpu_worker_multiplexes_out_of_order_responses() -> None:
+    fixture = Path(__file__).parent / "fixtures" / "fake_embedding_gpu_worker.py"
+    worker = _GpuEmbedderWorker(
+        replace(_settings(), gpu_forward_concurrency=2),
+        command=[sys.executable, str(fixture)],
+    )
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            slow = executor.submit(worker.encode, ["slow"])
+            fast = executor.submit(worker.encode, ["fast"])
+            fast_result = fast.result(timeout=1)
+            assert not slow.done()
+            slow_result = slow.result(timeout=1)
+
+        assert fast_result == ([[2.0]], 123.0)
+        assert slow_result == ([[1.0]], 123.0)
+    finally:
+        worker.terminate()
+
+
+def test_gpu_worker_isolates_correlated_errors() -> None:
+    fixture = Path(__file__).parent / "fixtures" / "fake_embedding_gpu_worker.py"
+    worker = _GpuEmbedderWorker(
+        replace(_settings(), gpu_forward_concurrency=2),
+        command=[sys.executable, str(fixture)],
+    )
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            failed = executor.submit(worker.encode, ["error"])
+            succeeded = executor.submit(worker.encode, ["fast"])
+            assert succeeded.result(timeout=1) == ([[2.0]], 123.0)
+            with pytest.raises(RuntimeError, match="fake failure"):
+                failed.result(timeout=1)
+    finally:
+        worker.terminate()
+
+
+def test_gpu_worker_eof_fails_all_pending_calls_and_terminate_is_idempotent() -> None:
+    fixture = Path(__file__).parent / "fixtures" / "fake_embedding_gpu_worker.py"
+    worker = _GpuEmbedderWorker(
+        replace(_settings(), gpu_forward_concurrency=2),
+        command=[sys.executable, str(fixture)],
+    )
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        slow = executor.submit(worker.encode, ["slow"])
+        exiting = executor.submit(worker.encode, ["exit"])
+        with pytest.raises(RuntimeError, match="exited before responding"):
+            exiting.result(timeout=1)
+        with pytest.raises(RuntimeError, match="exited before responding"):
+            slow.result(timeout=1)
+
+    worker.terminate()
+    worker.terminate()
+    assert not worker.is_running()
+
+
+def test_gpu_worker_serves_encode_requests_concurrently() -> None:
+    from provider.gpu_worker import serve_requests
+
+    lock = threading.Lock()
+    forwards_in_flight = 0
+    peak_in_flight = 0
+
+    class SlowModel:
+        def encode(self, texts: list[str]) -> list[list[float]]:
+            nonlocal forwards_in_flight, peak_in_flight
+            with lock:
+                forwards_in_flight += 1
+                peak_in_flight = max(peak_in_flight, forwards_in_flight)
+            time.sleep(0.05)
+            with lock:
+                forwards_in_flight -= 1
+            return [[float(len(text))] for text in texts]
+
+    responses: list[dict[str, object]] = []
+    settings = replace(_settings(), gpu_forward_concurrency=2, normalize_embeddings=False)
+    requests = [
+        json.dumps({"id": "one", "op": "encode", "texts": ["a"]}),
+        json.dumps({"id": "two", "op": "encode", "texts": ["bb"]}),
+        json.dumps({"op": "shutdown"}),
+    ]
+
+    serve_requests(
+        requests,
+        model=SlowModel(),
+        settings=settings,
+        emit=responses.append,
+    )
+
+    assert peak_in_flight == 2
+    assert {response.get("id") for response in responses if response.get("id")} == {"one", "two"}
 
 
 def test_request_log_buffer_keeps_recent_inputs_and_qps_buckets() -> None:

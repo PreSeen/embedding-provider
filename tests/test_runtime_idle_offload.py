@@ -164,9 +164,11 @@ class EmbedderRuntimeIdleOffloadTests(unittest.TestCase):
             "BATCH_WINDOW_MS": "200",
             "IDLE_OFFLOAD_SECONDS": "1",
             "IDLE_OFFLOAD_POLL_SECONDS": "1",
+            "DEVICE_SWITCH_MIN_SECONDS": "0",
             "CPU_TO_GPU_SCALE_UP_TEXTS": "3",
             "GPU_TO_CPU_SCALE_DOWN_TEXTS": "2",
             "GPU_TO_CPU_SCALE_DOWN_SECONDS": "30",
+            "GPU_FORWARD_CONCURRENCY": "3",
             "NORMALIZE_EMBEDDINGS": "true",
             "DTYPE": "float32",
             "TRUST_REMOTE_CODE": "true",
@@ -191,12 +193,18 @@ class EmbedderRuntimeIdleOffloadTests(unittest.TestCase):
             patch("provider.app._probe_cuda_memory_bytes", return_value=(8 * 1024**3, 24 * 1024**3)),
         ):
             runtime = EmbedderRuntime(Settings.from_env())
-            self.assertEqual(runtime.runtime_status()["loaded_device"], "none")
+            status = runtime.runtime_status()
+            self.assertEqual(status["loaded_device"], "none")
+            self.assertEqual(status["gpu_forward_concurrency_configured"], 3)
+            self.assertEqual(status["gpu_forward_concurrency_effective"], 1)
+            self.assertEqual(status["gpu_forwards_in_flight"], 0)
+            self.assertEqual(status["gpu_forward_peak_in_flight"], 0)
 
             embeddings = runtime.encode(["hello world"])
             self.assertEqual(len(embeddings), 1)
             self.assertEqual(runtime.runtime_status()["loaded_device"], "cuda")
             self.assertEqual(runtime.runtime_status()["engine_state"], "hot")
+            self.assertEqual(runtime.runtime_status()["gpu_forward_concurrency_effective"], 3)
 
             runtime._last_encode_finished_at -= 2
             offloaded = runtime.maybe_offload_idle()
@@ -204,6 +212,7 @@ class EmbedderRuntimeIdleOffloadTests(unittest.TestCase):
             self.assertEqual(runtime.runtime_status()["loaded_device"], "cpu")
             self.assertEqual(runtime.runtime_status()["preferred_device"], "cpu")
             self.assertEqual(runtime.runtime_status()["engine_state"], "hot")
+            self.assertEqual(runtime.runtime_status()["gpu_forward_concurrency_effective"], 1)
 
             embeddings = runtime.encode(["hello world"])
             self.assertEqual(len(embeddings), 1)
@@ -300,6 +309,32 @@ class EmbedderRuntimeIdleOffloadTests(unittest.TestCase):
                 self.assertEqual(status["loaded_device"], "cpu")
                 self.assertEqual(status["preferred_device"], "cpu")
                 self.assertIsNone(status["worker_pid"])
+            finally:
+                runtime.close()
+
+    def test_device_switch_cooldown_defers_automatic_scale_up(self) -> None:
+        with (
+            patch.dict(os.environ, {"START_DEVICE": "cpu", "DEVICE_SWITCH_MIN_SECONDS": "30"}),
+            patch("provider.app._GpuEmbedderWorker", FakeWorker),
+            patch("provider.app._detect_preferred_device", return_value="cuda"),
+            patch("provider.app._probe_cuda_memory_bytes", return_value=(8 * 1024**3, 24 * 1024**3)),
+        ):
+            runtime = EmbedderRuntime(Settings.from_env())
+            try:
+                runtime.encode(["one", "two", "three"])
+                self.assertEqual(runtime.runtime_status()["loaded_device"], "cuda")
+
+                runtime._switch_to_cpu(mark_offload=True)
+                self.assertEqual(runtime.runtime_status()["loaded_device"], "cpu")
+
+                runtime.encode(["one", "two", "three"])
+                status = runtime.runtime_status()
+                self.assertEqual(status["loaded_device"], "cpu")
+                self.assertGreater(status["device_switch_cooldown_remaining_seconds"], 0)
+
+                runtime._last_device_switch_at -= 31
+                runtime.encode(["one", "two", "three"])
+                self.assertEqual(runtime.runtime_status()["loaded_device"], "cuda")
             finally:
                 runtime.close()
 

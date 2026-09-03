@@ -3,6 +3,9 @@ from __future__ import annotations
 import json
 import logging
 import sys
+import threading
+from collections.abc import Callable, Iterable
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import numpy as np
@@ -13,11 +16,14 @@ from provider.config import Settings
 
 log = logging.getLogger("embedding_provider_worker")
 logging.basicConfig(level="INFO")
+_emit_lock = threading.Lock()
+_memory_sample_lock = threading.Lock()
 
 
 def _emit(payload: dict[str, object]) -> None:
-    sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
-    sys.stdout.flush()
+    with _emit_lock:
+        sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        sys.stdout.flush()
 
 
 def _resolve_dtype(name: str) -> torch.dtype:
@@ -108,74 +114,118 @@ def _load_model(settings: Settings) -> Any:
     return model
 
 
+def _handle_request(
+    request: dict[str, Any],
+    *,
+    model: Any,
+    settings: Settings,
+    encode_signature: Any,
+    emit: Callable[[dict[str, object]], None],
+) -> None:
+    request_id = request.get("id")
+    op = str(request.get("op") or "")
+    if op == "empty_cache":
+        torch.cuda.empty_cache()
+        emit({"id": request_id, "status": "ok"})
+        return
+    if op != "encode":
+        emit({"id": request_id, "status": "error", "error": f"unsupported op: {op}"})
+        return
+
+    texts = [str(item) for item in request.get("texts") or []]
+    dimensions = request.get("dimensions")
+    task = request.get("task") or settings.embedding_task
+    kwargs: dict[str, Any] = {}
+    input_name = "texts" if "texts" in encode_signature.parameters else "sentences"
+    if task and "task" in encode_signature.parameters:
+        kwargs["task"] = str(task)
+    if dimensions and "truncate_dim" in encode_signature.parameters:
+        kwargs["truncate_dim"] = int(dimensions)
+    if settings.max_length and "max_length" in encode_signature.parameters:
+        kwargs["max_length"] = settings.max_length
+    sample_bytes_per_text = None
+    owns_memory_sample = _memory_sample_lock.acquire(blocking=False)
+    try:
+        if owns_memory_sample:
+            torch.cuda.reset_peak_memory_stats()
+            mem_before = torch.cuda.memory_allocated()
+        with torch.no_grad():
+            outputs = model.encode(**{input_name: texts}, **kwargs)
+        if owns_memory_sample:
+            delta = torch.cuda.max_memory_allocated() - mem_before
+            if delta > 0 and texts:
+                sample_bytes_per_text = float(delta / len(texts))
+        array = _outputs_to_numpy(outputs)
+        if array.ndim == 1:
+            array = np.expand_dims(array, axis=0)
+        if dimensions and "truncate_dim" not in encode_signature.parameters:
+            requested = int(dimensions)
+            if requested > array.shape[1]:
+                raise ValueError(f"Requested dimensions={requested} but model only produced {array.shape[1]}")
+            array = array[:, :requested]
+        if settings.normalize_embeddings:
+            norms = np.linalg.norm(array, axis=1, keepdims=True)
+            norms = np.where(norms == 0.0, 1.0, norms)
+            array = array / norms
+        emit(
+            {
+                "id": request_id,
+                "status": "ok",
+                "embeddings": array.tolist(),
+                "sample_bytes_per_text": sample_bytes_per_text,
+            }
+        )
+    except Exception as exc:
+        emit({"id": request_id, "status": "error", "error": repr(exc)})
+    finally:
+        if owns_memory_sample:
+            _memory_sample_lock.release()
+
+
+def serve_requests(
+    requests: Iterable[str],
+    *,
+    model: Any,
+    settings: Settings,
+    emit: Callable[[dict[str, object]], None] = _emit,
+) -> None:
+    encode_signature = __import__("inspect").signature(model.encode)
+    shutdown_requested = False
+    with ThreadPoolExecutor(
+        max_workers=settings.gpu_forward_concurrency,
+        thread_name_prefix="embedding-gpu-forward",
+    ) as executor:
+        for raw in requests:
+            line = raw.strip()
+            if not line:
+                continue
+            request = json.loads(line)
+            if str(request.get("op") or "") == "shutdown":
+                shutdown_requested = True
+                break
+            executor.submit(
+                _handle_request,
+                request,
+                model=model,
+                settings=settings,
+                encode_signature=encode_signature,
+                emit=emit,
+            )
+    if shutdown_requested:
+        emit({"status": "ok"})
+
+
 def main() -> int:
     settings = Settings.from_env()
     try:
         model = _load_model(settings)
-        encode_signature = __import__("inspect").signature(model.encode)
     except Exception as exc:
         _emit({"status": "error", "error": repr(exc)})
         return 1
 
     _emit({"status": "ready", "device": "cuda", "model": settings.model_id})
 
-    for raw in sys.stdin:
-        line = raw.strip()
-        if not line:
-            continue
-        request = json.loads(line)
-        op = str(request.get("op") or "")
-        if op == "shutdown":
-            _emit({"status": "ok"})
-            return 0
-        if op == "empty_cache":
-            torch.cuda.empty_cache()
-            _emit({"status": "ok"})
-            continue
-        if op != "encode":
-            _emit({"status": "error", "error": f"unsupported op: {op}"})
-            continue
-        texts = [str(item) for item in request.get("texts") or []]
-        dimensions = request.get("dimensions")
-        task = request.get("task") or settings.embedding_task
-        kwargs: dict[str, Any] = {}
-        input_name = "texts" if "texts" in encode_signature.parameters else "sentences"
-        if task and "task" in encode_signature.parameters:
-            kwargs["task"] = str(task)
-        if dimensions and "truncate_dim" in encode_signature.parameters:
-            kwargs["truncate_dim"] = int(dimensions)
-        if settings.max_length and "max_length" in encode_signature.parameters:
-            kwargs["max_length"] = settings.max_length
-        sample_bytes_per_text = None
-        try:
-            torch.cuda.reset_peak_memory_stats()
-            mem_before = torch.cuda.memory_allocated()
-            with torch.no_grad():
-                outputs = model.encode(**{input_name: texts}, **kwargs)
-            delta = torch.cuda.max_memory_allocated() - mem_before
-            if delta > 0 and texts:
-                sample_bytes_per_text = float(delta / len(texts))
-            array = _outputs_to_numpy(outputs)
-            if array.ndim == 1:
-                array = np.expand_dims(array, axis=0)
-            if dimensions and "truncate_dim" not in encode_signature.parameters:
-                requested = int(dimensions)
-                if requested > array.shape[1]:
-                    raise ValueError(f"Requested dimensions={requested} but model only produced {array.shape[1]}")
-                array = array[:, :requested]
-            if settings.normalize_embeddings:
-                norms = np.linalg.norm(array, axis=1, keepdims=True)
-                norms = np.where(norms == 0.0, 1.0, norms)
-                array = array / norms
-            _emit(
-                {
-                    "status": "ok",
-                    "embeddings": array.tolist(),
-                    "sample_bytes_per_text": sample_bytes_per_text,
-                }
-            )
-        except Exception as exc:
-            _emit({"status": "error", "error": repr(exc)})
+    serve_requests(sys.stdin, model=model, settings=settings)
     return 0
 
 

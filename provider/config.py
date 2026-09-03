@@ -22,6 +22,13 @@ def _env_float(name: str, default: str) -> float:
     return float(os.getenv(name, default))
 
 
+def _positive_env_int(name: str, default: str) -> int:
+    value = int(os.getenv(name, default))
+    if value < 1:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
 @dataclass(frozen=True)
 class Settings:
     service_name: str
@@ -39,6 +46,7 @@ class Settings:
     batch_window_ms: int
     idle_offload_seconds: float
     idle_offload_poll_seconds: float
+    device_switch_min_seconds: float
     cpu_batch_target: int
     cpu_to_gpu_scale_up_texts: int
     gpu_to_cpu_scale_down_texts: int
@@ -48,8 +56,10 @@ class Settings:
     request_log_limit: int = 100_000
     embedding_cache_limit: int = 100_000
     cuda_batch_growth_factor: int = 2
+    cuda_batch_demand_ema_alpha: float = 0.75
     cuda_vram_safety_fixed_mb: int = 512
     cuda_vram_safety_total_ratio: float = 0.05
+    gpu_forward_concurrency: int = 1
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -69,15 +79,18 @@ class Settings:
             batch_window_ms=_env_int("BATCH_WINDOW_MS", "200") or 200,
             idle_offload_seconds=float(os.getenv("IDLE_OFFLOAD_SECONDS", "1800")),
             idle_offload_poll_seconds=float(os.getenv("IDLE_OFFLOAD_POLL_SECONDS", "30")),
+            device_switch_min_seconds=float(os.getenv("DEVICE_SWITCH_MIN_SECONDS", "30")),
             cpu_batch_target=_env_int("CPU_BATCH_TARGET", "8") or 8,
             cpu_to_gpu_scale_up_texts=_env_int("CPU_TO_GPU_SCALE_UP_TEXTS", "8") or 0,
-            gpu_to_cpu_scale_down_texts=_env_int("GPU_TO_CPU_SCALE_DOWN_TEXTS", "2") or 0,
+            gpu_to_cpu_scale_down_texts=_env_int("GPU_TO_CPU_SCALE_DOWN_TEXTS", "8") or 0,
             gpu_to_cpu_scale_down_seconds=float(os.getenv("GPU_TO_CPU_SCALE_DOWN_SECONDS", "30")),
             start_device=os.getenv("START_DEVICE", "auto").strip().lower(),
             cuda_visible_devices=os.getenv("CUDA_VISIBLE_DEVICES") or None,
             request_log_limit=_env_int("REQUEST_LOG_LIMIT", "100000") or 100_000,
             embedding_cache_limit=_env_int("EMBEDDING_CACHE_LIMIT", "100000") or 100_000,
             cuda_batch_growth_factor=_env_int("CUDA_BATCH_GROWTH_FACTOR", "2") or 2,
+            cuda_batch_demand_ema_alpha=_env_float("CUDA_BATCH_DEMAND_EMA_ALPHA", "0.75"),
             cuda_vram_safety_fixed_mb=_env_int("CUDA_VRAM_SAFETY_FIXED_MB", "512") or 512,
             cuda_vram_safety_total_ratio=_env_float("CUDA_VRAM_SAFETY_TOTAL_RATIO", "0.05"),
+            gpu_forward_concurrency=_positive_env_int("GPU_FORWARD_CONCURRENCY", "1"),
         )

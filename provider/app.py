@@ -14,6 +14,7 @@ import subprocess
 import sys
 import time
 from collections import OrderedDict, defaultdict, deque
+from concurrent.futures import Future
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -448,13 +449,22 @@ class AdaptiveBatchState:
     _DEFAULT_MAX_TARGET = 64
     _MIN_TARGET = 1
 
-    def __init__(self, configured_max_batch_size: int | None, *, growth_factor: int = 2) -> None:
+    def __init__(
+        self,
+        configured_max_batch_size: int | None,
+        *,
+        growth_factor: int = 2,
+        demand_ema_alpha: float = 0.5,
+    ) -> None:
         configured_cap = configured_max_batch_size or self._DEFAULT_MAX_TARGET
         self._hard_cap = max(1, int(configured_cap))
         self._initial_target = min(self._MIN_TARGET, self._hard_cap)
         self._growth_factor = max(1, int(growth_factor))
+        self._demand_ema_alpha = max(0.0, min(1.0, float(demand_ema_alpha)))
+        self._demand_ema: float | None = None
         self._current_target = self._initial_target
         self._last_batch_texts = 0
+        self._last_observed_demand = 0
         self._last_vram_cap: int | None = None
         self._adjustments_total = 0
         self._oom_target_ceiling: int | None = None
@@ -473,6 +483,8 @@ class AdaptiveBatchState:
         with self._lock:
             self._current_target = self._initial_target
             self._last_batch_texts = 0
+            self._last_observed_demand = 0
+            self._demand_ema = None
             self._last_vram_cap = None
             self._oom_target_ceiling = None
             self._adjustments_total += 1
@@ -492,6 +504,27 @@ class AdaptiveBatchState:
                 self._current_target = next_target
                 self._adjustments_total += 1
 
+    def record_observed_demand(self, *, text_count: int) -> None:
+        observed = max(1, int(text_count))
+        with self._lock:
+            self._last_observed_demand = observed
+            if self._demand_ema is None:
+                self._demand_ema = float(observed)
+            else:
+                alpha = self._demand_ema_alpha
+                self._demand_ema = alpha * observed + (1.0 - alpha) * self._demand_ema
+
+            target_demand = max(1, int(round(self._demand_ema)))
+            if target_demand >= self._current_target:
+                return
+            next_target = self._next_power_of_two(target_demand)
+            next_target = max(self._initial_target, min(self._current_target, next_target, self._hard_cap))
+            if self._oom_target_ceiling is not None:
+                next_target = min(next_target, self._oom_target_ceiling)
+            if next_target < self._current_target:
+                self._current_target = next_target
+                self._adjustments_total += 1
+
     def record_oom_backoff(self, *, failed_text_count: int) -> None:
         with self._lock:
             next_target = max(self._initial_target, min(self._hard_cap, max(1, int(failed_text_count) // 2)))
@@ -504,13 +537,15 @@ class AdaptiveBatchState:
                 self._current_target = next_target
                 self._adjustments_total += 1
 
-    def snapshot(self) -> dict[str, int | None]:
+    def snapshot(self) -> dict[str, int | float | None]:
         with self._lock:
             return {
                 "current_target": self._current_target,
                 "initial_target": self._initial_target,
                 "hard_cap": self._hard_cap,
                 "last_batch_texts": self._last_batch_texts,
+                "last_observed_demand": self._last_observed_demand,
+                "demand_ema": round(self._demand_ema, 3) if self._demand_ema is not None else None,
                 "last_vram_cap": self._last_vram_cap,
                 "oom_target_ceiling": self._oom_target_ceiling,
                 "adjustments_total": self._adjustments_total,
@@ -521,6 +556,11 @@ class AdaptiveBatchState:
         if vram_cap is not None:
             target = min(target, max(1, int(vram_cap)))
         return max(1, target)
+
+    @staticmethod
+    def _next_power_of_two(value: int) -> int:
+        value = max(1, int(value))
+        return 1 << (value - 1).bit_length()
 
 
 class EmbeddingRequest(BaseModel):
@@ -677,11 +717,19 @@ class ModelList(BaseModel):
 
 
 class _GpuEmbedderWorker:
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, *, command: list[str] | None = None) -> None:
         self._settings = settings
         self._root_dir = Path(__file__).resolve().parents[1]
+        self._command = command or [sys.executable, "-m", "provider.gpu_worker"]
         self._process: subprocess.Popen[str] | None = None
-        self._io_lock = threading.RLock()
+        self._lifecycle_lock = threading.RLock()
+        self._write_lock = threading.Lock()
+        self._pending_lock = threading.Lock()
+        self._pending: dict[str, tuple[int, Future[dict[str, Any]]]] = {}
+        self._reader_thread: threading.Thread | None = None
+        self._generation = 0
+        self._forward_slots = threading.BoundedSemaphore(settings.gpu_forward_concurrency)
+        self._maintenance_lock = threading.Lock()
         self._device_name = "none"
 
     @property
@@ -694,16 +742,18 @@ class _GpuEmbedderWorker:
         return self._process is not None and self._process.poll() is None
 
     def ensure_started(self) -> str:
-        with self._io_lock:
+        with self._lifecycle_lock:
             if self.is_running():
                 return self._device_name
+            self._generation += 1
+            generation = self._generation
             env = os.environ.copy()
             env["PYTHONUNBUFFERED"] = "1"
             env["START_DEVICE"] = "cuda"
             if self._settings.cuda_visible_devices:
                 env["CUDA_VISIBLE_DEVICES"] = self._settings.cuda_visible_devices
             self._process = subprocess.Popen(
-                [sys.executable, "-m", "provider.gpu_worker"],
+                self._command,
                 cwd=str(self._root_dir),
                 env=env,
                 stdin=subprocess.PIPE,
@@ -716,6 +766,13 @@ class _GpuEmbedderWorker:
                 self.terminate()
                 raise RuntimeError(str(message.get("error") or "failed to start embedding GPU worker"))
             self._device_name = str(message.get("device") or "cuda")
+            self._reader_thread = threading.Thread(
+                target=self._read_responses,
+                args=(self._process, generation),
+                name="embedding-gpu-worker-reader",
+                daemon=True,
+            )
+            self._reader_thread.start()
             return self._device_name
 
     def encode(
@@ -726,23 +783,33 @@ class _GpuEmbedderWorker:
         task: str | None = None,
     ) -> tuple[list[list[float]], float | None]:
         effective_task = task or self._settings.embedding_task
-        response = self._request(
-            {
-                "op": "encode",
-                "texts": texts,
-                "dimensions": dimensions,
-                "task": effective_task,
-            }
-        )
+        with self._forward_slots:
+            response = self._request(
+                {
+                    "op": "encode",
+                    "texts": texts,
+                    "dimensions": dimensions,
+                    "task": effective_task,
+                }
+            )
         embeddings = [[float(value) for value in row] for row in response.get("embeddings") or []]
         sample = response.get("sample_bytes_per_text")
         return embeddings, float(sample) if sample is not None else None
 
     def empty_cache(self) -> None:
-        self._request({"op": "empty_cache"})
+        with self._maintenance_lock:
+            acquired = 0
+            try:
+                for _ in range(self._settings.gpu_forward_concurrency):
+                    self._forward_slots.acquire()
+                    acquired += 1
+                self._request({"op": "empty_cache"})
+            finally:
+                for _ in range(acquired):
+                    self._forward_slots.release()
 
     def terminate(self) -> None:
-        with self._io_lock:
+        with self._lifecycle_lock:
             process = self._process
             self._process = None
             self._device_name = "none"
@@ -759,12 +826,26 @@ class _GpuEmbedderWorker:
                     except Exception:
                         process.kill()
                         process.wait(timeout=5)
+            self._fail_pending(RuntimeError("embedding GPU worker stopped"))
 
     def _request(self, payload: dict[str, Any]) -> dict[str, Any]:
-        with self._io_lock:
-            self.ensure_started()
-            self._write_message(payload)
-            response = self._read_message()
+        self.ensure_started()
+        with self._lifecycle_lock:
+            generation = self._generation
+        request_id = uuid4().hex
+        future: Future[dict[str, Any]] = Future()
+        message = dict(payload)
+        message["id"] = request_id
+        with self._pending_lock:
+            self._pending[request_id] = (generation, future)
+        try:
+            with self._write_lock:
+                self._write_message(message)
+            response = future.result()
+        except Exception:
+            with self._pending_lock:
+                self._pending.pop(request_id, None)
+            raise
         if str(response.get("status")) != "ok":
             raise RuntimeError(str(response.get("error") or "embedding GPU worker request failed"))
         return response
@@ -783,6 +864,45 @@ class _GpuEmbedderWorker:
         if not line:
             return {"status": "error", "error": "embedding GPU worker exited before responding"}
         return json.loads(line)
+
+    def _read_responses(self, process: subprocess.Popen[str], generation: int) -> None:
+        if process.stdout is None:
+            self._fail_pending(RuntimeError("embedding GPU worker stdout is unavailable"), generation=generation)
+            return
+        try:
+            for line in process.stdout:
+                response = json.loads(line)
+                request_id = response.get("id")
+                if request_id is None:
+                    continue
+                with self._pending_lock:
+                    entry = self._pending.get(str(request_id))
+                    if entry is not None and entry[0] == generation:
+                        self._pending.pop(str(request_id), None)
+                        future = entry[1]
+                    else:
+                        future = None
+                if future is not None and not future.done():
+                    future.set_result(response)
+        except Exception as exc:
+            self._fail_pending(exc, generation=generation)
+            return
+        self._fail_pending(
+            RuntimeError("embedding GPU worker exited before responding"),
+            generation=generation,
+        )
+
+    def _fail_pending(self, exc: Exception, *, generation: int | None = None) -> None:
+        with self._pending_lock:
+            request_ids = [
+                request_id
+                for request_id, (request_generation, _future) in self._pending.items()
+                if generation is None or request_generation == generation
+            ]
+            pending = [self._pending.pop(request_id)[1] for request_id in request_ids]
+        for future in pending:
+            if not future.done():
+                future.set_exception(exc)
 
 
 class EmbedderRuntime:
@@ -808,12 +928,16 @@ class EmbedderRuntime:
         self.adaptive_batch = AdaptiveBatchState(
             settings.max_batch_size,
             growth_factor=settings.cuda_batch_growth_factor,
+            demand_ema_alpha=settings.cuda_batch_demand_ema_alpha,
         )
         self._engine_state = "offloaded" if self._use_gpu_worker else "hot"
         self._reload_in_progress = False
         self._inflight_encodes = 0
+        self._gpu_forwards_in_flight = 0
+        self._gpu_forward_peak_in_flight = 0
         self._last_encode_finished_at = time.monotonic()
         self._last_offloaded_at: float | None = None
+        self._last_device_switch_at: float | None = None
         self._gpu_low_batch_since: float | None = None
         self._idle_offload_enabled = self._detected_device == "cuda" and settings.idle_offload_seconds > 0
         self._stats: ProviderRuntimeStats | None = None
@@ -887,6 +1011,10 @@ class EmbedderRuntime:
                 "idle_offload_poll_seconds": (
                     self._settings.idle_offload_poll_seconds if self._idle_offload_enabled else None
                 ),
+                "device_switch_min_seconds": self._settings.device_switch_min_seconds,
+                "device_switch_cooldown_remaining_seconds": round(
+                    self._device_switch_cooldown_remaining_locked(), 3
+                ),
                 "cpu_batch_target": self._settings.cpu_batch_target,
                 "effective_batch_target": self.estimate_max_texts(),
                 "cpu_to_gpu_scale_up_texts": self._settings.cpu_to_gpu_scale_up_texts,
@@ -897,6 +1025,12 @@ class EmbedderRuntime:
                     if self._gpu_low_batch_since is not None else None
                 ),
                 "inflight_encodes": self._inflight_encodes,
+                "gpu_forward_concurrency_configured": self._settings.gpu_forward_concurrency,
+                "gpu_forward_concurrency_effective": (
+                    self._settings.gpu_forward_concurrency if self.device_name == "cuda" else 1
+                ),
+                "gpu_forwards_in_flight": self._gpu_forwards_in_flight,
+                "gpu_forward_peak_in_flight": self._gpu_forward_peak_in_flight,
                 "idle_for_seconds": round(idle_for, 3),
                 "offloaded_for_seconds": round(offloaded_for, 3) if offloaded_for is not None else None,
                 "reload_in_progress": self._reload_in_progress,
@@ -904,9 +1038,28 @@ class EmbedderRuntime:
                 "adaptive_batch": self.adaptive_batch.snapshot(),
             }
 
+    def _device_switch_cooldown_remaining_locked(self) -> float:
+        min_seconds = max(0.0, self._settings.device_switch_min_seconds)
+        if self._last_device_switch_at is None or min_seconds <= 0:
+            return 0.0
+        return max(0.0, min_seconds - (time.monotonic() - self._last_device_switch_at))
+
+    def _device_switch_cooldown_remaining(self) -> float:
+        with self._model_lock:
+            return self._device_switch_cooldown_remaining_locked()
+
     def close(self) -> None:
+        with self._model_lock:
+            while self._inflight_encodes > 0:
+                self._model_lock.wait()
         if self._gpu_worker is not None:
             self._gpu_worker.terminate()
+
+    def effective_gpu_forward_concurrency(self) -> int:
+        with self._model_lock:
+            if self.device_name != "cuda" or not self._use_gpu_worker:
+                return 1
+            return self._settings.gpu_forward_concurrency
 
     def maybe_offload_idle(self) -> bool:
         if not self._idle_offload_enabled:
@@ -932,6 +1085,10 @@ class EmbedderRuntime:
                 idle_for = time.monotonic() - self._last_encode_finished_at
                 should_offload = idle_for >= self._settings.idle_offload_seconds
             if not should_offload:
+                return False
+            cooldown_remaining = self._device_switch_cooldown_remaining_locked()
+            if cooldown_remaining > 0:
+                log.info("device switch cooldown active for %.1fs; deferring CPU offload", cooldown_remaining)
                 return False
         self._switch_to_cpu(mark_offload=True)
         return True
@@ -977,6 +1134,10 @@ class EmbedderRuntime:
             or self._cuda_fallback_reason is not None
         ):
             return
+        cooldown_remaining = self._device_switch_cooldown_remaining()
+        if cooldown_remaining > 0:
+            log.info("device switch cooldown active for %.1fs; deferring CUDA scale-up", cooldown_remaining)
+            return
         self._switch_to_cuda(wait_for_idle=False)
 
     def switch_device(self, target_device: str) -> dict[str, Any]:
@@ -1014,6 +1175,7 @@ class EmbedderRuntime:
                 self.device_name = "cpu"
                 self._engine_state = "hot"
                 self._last_offloaded_at = time.monotonic() if mark_offload else None
+                self._last_device_switch_at = time.monotonic()
             if old_model is not None:
                 del old_model
                 gc.collect()
@@ -1060,6 +1222,7 @@ class EmbedderRuntime:
                 self.device_name = device_name
                 self._engine_state = "hot"
                 self._last_offloaded_at = None
+                self._last_device_switch_at = time.monotonic()
                 self._gpu_low_batch_since = None
             if old_model is not None:
                 del old_model
@@ -1158,7 +1321,17 @@ class EmbedderRuntime:
                 self.device_name = device_name
                 self._engine_state = "hot"
                 self._last_offloaded_at = None
-            embeddings, sample = self._gpu_worker.encode(texts, dimensions=dimensions, task=task)
+            with self._model_lock:
+                self._gpu_forwards_in_flight += 1
+                self._gpu_forward_peak_in_flight = max(
+                    self._gpu_forward_peak_in_flight,
+                    self._gpu_forwards_in_flight,
+                )
+            try:
+                embeddings, sample = self._gpu_worker.encode(texts, dimensions=dimensions, task=task)
+            finally:
+                with self._model_lock:
+                    self._gpu_forwards_in_flight -= 1
             if sample is not None and sample > 0:
                 if self._bytes_per_text_ema is None:
                     self._bytes_per_text_ema = sample
@@ -1373,6 +1546,10 @@ class EmbedderRuntime:
                 or self._inflight_encodes > 0
             ):
                 return
+            cooldown_remaining = self._device_switch_cooldown_remaining_locked()
+            if cooldown_remaining > 0:
+                log.info("device switch cooldown active for %.1fs; deferring CPU scale-down", cooldown_remaining)
+                return
 
         log.info(
             "GPU batch stayed below scale-down threshold: texts=%d threshold=%d seconds=%.1f; switching to CPU",
@@ -1432,13 +1609,7 @@ class _PendingItem:
 
 
 class ContinuousBatcher:
-    """Collects requests within a time window and dispatches them as a single batch.
-
-    The worker loop is sequential: it collects a window of requests, runs one
-    GPU forward pass (per task/dimensions group), resolves all futures, then
-    starts the next window. This keeps GPU jobs serialized while requests queue
-    up naturally during inference.
-    """
+    """Collect requests into bounded batches and optionally split GPU forwards into lanes."""
 
     def __init__(self, runtime: EmbedderRuntime, stats: ProviderRuntimeStats, window_secs: float) -> None:
         self._runtime = runtime
@@ -1501,10 +1672,12 @@ class ContinuousBatcher:
     async def _worker(self) -> None:
         loop = asyncio.get_running_loop()
         pending: list[_PendingItem] = []
+        pending_from_overflow = False
         while True:
             if not pending:
                 # Block until at least one request arrives.
                 pending.append(await self._queue.get())
+                pending_from_overflow = False
 
                 # Drain for the remaining window.
                 deadline = loop.time() + self._window
@@ -1529,9 +1702,16 @@ class ContinuousBatcher:
 
             # Dispatch; overflow (texts that didn't fit in VRAM) is returned
             # and processed immediately in the next iteration without a new window wait.
-            pending = await self._dispatch(pending, loop)
+            pending = await self._dispatch(pending, loop, observe_demand=not pending_from_overflow)
+            pending_from_overflow = bool(pending)
 
-    async def _dispatch(self, batch: list[_PendingItem], loop: asyncio.AbstractEventLoop) -> list[_PendingItem]:
+    async def _dispatch(
+        self,
+        batch: list[_PendingItem],
+        loop: asyncio.AbstractEventLoop,
+        *,
+        observe_demand: bool,
+    ) -> list[_PendingItem]:
         stale_count = sum(1 for item in batch if item.state.future.done())
         if stale_count:
             batch = [item for item in batch if not item.state.future.done()]
@@ -1549,39 +1729,52 @@ class ContinuousBatcher:
         for (task, dimensions), items in groups.items():
             # Cap this group by available VRAM; overflow is deferred to next iteration.
             max_texts = max(1, self._runtime.estimate_max_texts())
+            if observe_demand and getattr(self._runtime, "_preferred_device", None) == "cuda":
+                self._runtime.adaptive_batch.record_observed_demand(text_count=len(items))
             to_process = items[:max_texts]
             overflow.extend(items[max_texts:])
             group_overflow = len(items) - len(to_process)
             all_texts = [item.text for item in to_process]
             text_count = len(all_texts)
+            concurrency_getter = getattr(self._runtime, "effective_gpu_forward_concurrency", None)
+            concurrency = max(1, int(concurrency_getter())) if callable(concurrency_getter) else 1
+            lane_count = min(concurrency, text_count)
+            lane_size = max(1, math.ceil(text_count / lane_count))
+            lanes = [to_process[index:index + lane_size] for index in range(0, text_count, lane_size)]
 
             log.info(
-                "batch dispatch: requests=%d texts=%d overflow=%d task=%s dim=%s",
-                len({item.request_id for item in to_process}), text_count, group_overflow, task, dimensions,
+                "batch dispatch: requests=%d texts=%d overflow=%d lanes=%d task=%s dim=%s",
+                len({item.request_id for item in to_process}), text_count, group_overflow, len(lanes), task, dimensions,
             )
             self._stats.record_batch_dispatch(request_count=len({item.request_id for item in to_process}), text_count=text_count)
             self._stats.set_running_batch(text_count=text_count)
-            fn = functools.partial(
-                self._runtime.encode,
-                all_texts,
-                dimensions=dimensions,
-                task=task,
-                allow_batch_growth=group_overflow > 0,
-            )
+            async def encode_lane(lane: list[_PendingItem]) -> tuple[list[_PendingItem], list[list[float]]]:
+                fn = functools.partial(
+                    self._runtime.encode,
+                    [item.text for item in lane],
+                    dimensions=dimensions,
+                    task=task,
+                    allow_batch_growth=group_overflow > 0 and len(lanes) == 1,
+                )
+                return lane, await loop.run_in_executor(None, fn)
+
             try:
-                embeddings: list[list[float]] = await loop.run_in_executor(None, fn)
-                for item, embedding in zip(to_process, embeddings):
-                    state = item.state
-                    if state.future.done():
+                results = await asyncio.gather(*(encode_lane(lane) for lane in lanes), return_exceptions=True)
+                for lane, result in zip(lanes, results):
+                    if isinstance(result, BaseException):
+                        for item in lane:
+                            if not item.state.future.done():
+                                item.state.future.set_exception(result)
                         continue
-                    state.embeddings[item.input_index] = embedding
-                    state.remaining -= 1
-                    if state.remaining <= 0:
-                        state.future.set_result([row or [] for row in state.embeddings])
-            except Exception as exc:
-                for item in to_process:
-                    if not item.state.future.done():
-                        item.state.future.set_exception(exc)
+                    completed_items, embeddings = result
+                    for item, embedding in zip(completed_items, embeddings):
+                        state = item.state
+                        if state.future.done():
+                            continue
+                        state.embeddings[item.input_index] = embedding
+                        state.remaining -= 1
+                        if state.remaining <= 0:
+                            state.future.set_result([row or [] for row in state.embeddings])
             finally:
                 self._stats.set_running_batch(text_count=0)
                 self._mark_processed(len(to_process))
