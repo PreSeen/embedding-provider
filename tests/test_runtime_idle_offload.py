@@ -496,6 +496,69 @@ class EmbedderRuntimeIdleOffloadTests(unittest.TestCase):
     def _cuda_retry_seconds() -> float:
         return Settings.from_env().cuda_retry_seconds
 
+    def test_gpu_worker_starts_on_the_card_with_the_most_free_vram(self) -> None:
+        from provider.app import _GpuEmbedderWorker
+
+        ready = (
+            "import json, os, sys; "
+            "print(json.dumps({'status': 'ready', 'device': 'cuda:' + os.environ['CUDA_VISIBLE_DEVICES']}), flush=True); "
+            "sys.stdin.read()"
+        )
+        free_by_index = {"0": 1 * 1024**3, "1": 20 * 1024**3}
+        probe = lambda gpu_index=None: (free_by_index[gpu_index or "0"], 32 * 1024**3)  # noqa: E731
+        with (
+            patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "0,1"}),
+            patch("provider.app._probe_cuda_memory_bytes", side_effect=probe),
+        ):
+            worker = _GpuEmbedderWorker(Settings.from_env(), command=[sys.executable, "-c", ready])
+            try:
+                device = worker.ensure_started()
+            finally:
+                worker.terminate()
+
+        # Only the chosen card is visible to the worker process.
+        self.assertEqual(device, "cuda:1")
+        self.assertEqual(worker.gpu_index, "1")
+
+    def test_gpu_worker_keeps_the_only_configured_card(self) -> None:
+        from provider.app import _GpuEmbedderWorker
+
+        ready = (
+            "import json, os, sys; "
+            "print(json.dumps({'status': 'ready', 'device': 'cuda:' + os.environ['CUDA_VISIBLE_DEVICES']}), flush=True); "
+            "sys.stdin.read()"
+        )
+        with (
+            patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "0"}),
+            patch("provider.app._probe_cuda_memory_bytes", side_effect=AssertionError("no probe for one card")),
+        ):
+            worker = _GpuEmbedderWorker(Settings.from_env(), command=[sys.executable, "-c", ready])
+            try:
+                device = worker.ensure_started()
+            finally:
+                worker.terminate()
+
+        self.assertEqual(device, "cuda:0")
+        self.assertEqual(worker.gpu_index, "0")
+
+    def test_gpu_card_choice_ties_and_failed_probes_fall_to_the_first_listed_card(self) -> None:
+        from provider.app import _pick_gpu_index
+
+        with patch("provider.app._probe_cuda_memory_bytes", return_value=(None, None)):
+            self.assertEqual(_pick_gpu_index("1,0"), "1")
+        with patch("provider.app._probe_cuda_memory_bytes", return_value=(8 * 1024**3, 32 * 1024**3)):
+            self.assertEqual(_pick_gpu_index("1,0"), "1")
+        self.assertIsNone(_pick_gpu_index(None))
+        self.assertIsNone(_pick_gpu_index(""))
+
+    def test_runtime_status_reports_the_card_the_gpu_worker_runs_on(self) -> None:
+        runtime, workers = self._retry_runtime([True])
+
+        runtime.encode(["hello"])
+        workers[0].gpu_index = "1"
+
+        self.assertEqual(runtime.runtime_status()["cuda_device_index"], "1")
+
     def test_encode_splits_static_batch_size_by_available_vram_cap(self) -> None:
         workers: list[FakeWorker] = []
 

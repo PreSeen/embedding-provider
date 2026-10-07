@@ -56,13 +56,13 @@ def _resolve_gpu_index() -> str | None:
     return None
 
 
-def _probe_cuda_memory_bytes() -> tuple[int | None, int | None]:
+def _probe_cuda_memory_bytes(gpu_index: str | None = None) -> tuple[int | None, int | None]:
     command = [
         "nvidia-smi",
         "--query-gpu=memory.free,memory.total",
         "--format=csv,noheader,nounits",
     ]
-    gpu_index = _resolve_gpu_index()
+    gpu_index = gpu_index if gpu_index is not None else _resolve_gpu_index()
     if gpu_index is not None:
         command.insert(1, f"--id={gpu_index}")
     try:
@@ -83,6 +83,21 @@ def _probe_cuda_memory_bytes() -> tuple[int | None, int | None]:
         return int(free_raw) * 1024 * 1024, int(total_raw) * 1024 * 1024
     except Exception:
         return None, None
+
+
+def _pick_gpu_index(visible_devices: str | None) -> str | None:
+    """Return the listed card with the most free VRAM (the first listed one on ties or failed probes)."""
+    candidates = [part.strip() for part in (visible_devices or "").split(",") if part.strip().isdigit()]
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+    best_index, best_free = candidates[0], -1
+    for index in candidates:
+        free, _total = _probe_cuda_memory_bytes(index)
+        if free is not None and free > best_free:
+            best_index, best_free = index, free
+    return best_index
 
 
 def _detect_preferred_device() -> str:
@@ -731,6 +746,7 @@ class _GpuEmbedderWorker:
         self._forward_slots = threading.BoundedSemaphore(settings.gpu_forward_concurrency)
         self._maintenance_lock = threading.Lock()
         self._device_name = "none"
+        self.gpu_index: str | None = None
 
     @property
     def pid(self) -> int | None:
@@ -750,7 +766,12 @@ class _GpuEmbedderWorker:
             env = os.environ.copy()
             env["PYTHONUNBUFFERED"] = "1"
             env["START_DEVICE"] = "cuda"
-            if self._settings.cuda_visible_devices:
+            # CUDA_VISIBLE_DEVICES may list several cards; the worker gets only the one with
+            # the most free VRAM at this moment (the LLM gateway moves its models between cards).
+            self.gpu_index = _pick_gpu_index(self._settings.cuda_visible_devices)
+            if self.gpu_index is not None:
+                env["CUDA_VISIBLE_DEVICES"] = self.gpu_index
+            elif self._settings.cuda_visible_devices:
                 env["CUDA_VISIBLE_DEVICES"] = self._settings.cuda_visible_devices
             self._process = subprocess.Popen(
                 self._command,
@@ -1007,6 +1028,7 @@ class EmbedderRuntime:
                 "start_device": self._settings.start_device,
                 "engine_state": self._engine_state,
                 "cuda_fallback_reason": self._cuda_fallback_reason,
+                "cuda_device_index": self._current_gpu_index(),
                 "cuda_retry_in_seconds": self._cuda_retry_remaining_locked(),
                 "idle_offload_enabled": self._idle_offload_enabled,
                 "idle_offload_seconds": self._settings.idle_offload_seconds if self._idle_offload_enabled else None,
@@ -1290,6 +1312,10 @@ class EmbedderRuntime:
             self._cuda_fallback_reason = reason
             self._cuda_fallback_at = time.monotonic()
 
+    def _current_gpu_index(self) -> str | None:
+        worker = self._gpu_worker
+        return getattr(worker, "gpu_index", None) if worker is not None else None
+
     def _cuda_retry_remaining_locked(self) -> float | None:
         """Seconds until the CPU fallback may be retried on CUDA; None when no fallback is active."""
         if self._cuda_fallback_reason is None or self._cuda_fallback_at is None:
@@ -1428,7 +1454,7 @@ class EmbedderRuntime:
                 self.adaptive_batch.record_oom_backoff(failed_text_count=len(texts))
             token_count = self._diagnostic_token_count(texts)
             char_count = sum(len(text) for text in texts)
-            free_vram, total_vram = _probe_cuda_memory_bytes()
+            free_vram, total_vram = _probe_cuda_memory_bytes(self._current_gpu_index())
             log.warning(
                 "CUDA OOM for model=%s batch_size=%s token_count=%s char_count=%d "
                 "max_length=%s device=%s free_vram_bytes=%s total_vram_bytes=%s",
@@ -1461,7 +1487,7 @@ class EmbedderRuntime:
                     if not _is_cuda_oom(retry_exc):
                         raise
                     self._release_cuda_cache()
-                    retry_free_vram, retry_total_vram = _probe_cuda_memory_bytes()
+                    retry_free_vram, retry_total_vram = _probe_cuda_memory_bytes(self._current_gpu_index())
                     log.warning(
                         "single-input CUDA OOM persisted after empty_cache: model=%s token_count=%s "
                         "char_count=%d max_length=%s device=%s free_vram_bytes=%s total_vram_bytes=%s",
@@ -1589,7 +1615,7 @@ class EmbedderRuntime:
         if self._preferred_device != "cuda":
             return hard_cap or 256
 
-        free, total = _probe_cuda_memory_bytes()
+        free, total = _probe_cuda_memory_bytes(self._current_gpu_index())
         if free is None or total is None:
             return hard_cap or 256
         safety = (
