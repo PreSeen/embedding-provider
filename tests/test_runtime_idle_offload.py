@@ -420,6 +420,82 @@ class EmbedderRuntimeIdleOffloadTests(unittest.TestCase):
         self.assertIn("CUDA out of memory", status["cuda_fallback_reason"])
         self.assertEqual(workers[0].starts, 1)
 
+    def _retry_runtime(self, outcomes: list[bool]):
+        """Runtime whose GPU worker starts succeed or fail per `outcomes` (True = starts)."""
+        workers: list[FakeWorker] = []
+
+        def fake_worker_factory(settings: Settings) -> FakeWorker:
+            ok = outcomes[len(workers)] if len(workers) < len(outcomes) else True
+            worker = FakeWorker(settings) if ok else FailingStartWorker(settings)
+            workers.append(worker)
+            return worker
+
+        patches = ExitStack()
+        patches.enter_context(patch("provider.app._GpuEmbedderWorker", side_effect=fake_worker_factory))
+        patches.enter_context(patch("provider.app._detect_preferred_device", return_value="cuda"))
+        patches.enter_context(
+            patch("provider.app._probe_cuda_memory_bytes", return_value=(8 * 1024**3, 24 * 1024**3))
+        )
+        self.addCleanup(patches.close)
+        runtime = EmbedderRuntime(Settings.from_env())
+        self.addCleanup(runtime.close)
+        return runtime, workers
+
+    def test_cpu_fallback_is_retried_on_cuda_after_the_cooldown_and_recovers(self) -> None:
+        runtime, workers = self._retry_runtime([False, True])
+
+        runtime.encode(["fallback"])
+        self.assertEqual(runtime.runtime_status()["loaded_device"], "cpu")
+        self.assertEqual(len(workers), 1)
+
+        # Inside the cooldown a batch must not start another GPU worker.
+        runtime.encode(["a", "b", "c"])
+        self.assertEqual(runtime.runtime_status()["loaded_device"], "cpu")
+        self.assertEqual(len(workers), 1)
+        self.assertGreater(runtime.runtime_status()["cuda_retry_in_seconds"], 0)
+
+        runtime._cuda_fallback_at -= self._cuda_retry_seconds() + 1
+        runtime.encode(["a", "b", "c"])
+
+        status = runtime.runtime_status()
+        self.assertEqual(status["loaded_device"], "cuda")
+        self.assertEqual(status["preferred_device"], "cuda")
+        self.assertIsNone(status["cuda_fallback_reason"])
+        self.assertIsNone(status["cuda_retry_in_seconds"])
+        self.assertTrue(status["idle_offload_enabled"])
+        self.assertEqual(len(workers), 2)
+
+    def test_failed_cuda_retry_stays_on_cpu_and_restarts_the_cooldown(self) -> None:
+        runtime, workers = self._retry_runtime([False, False, True])
+
+        runtime.encode(["fallback"])
+        runtime._cuda_fallback_at -= self._cuda_retry_seconds() + 1
+        runtime.encode(["a", "b", "c"])
+
+        status = runtime.runtime_status()
+        self.assertEqual(status["loaded_device"], "cpu")
+        self.assertIn("CUDA out of memory", status["cuda_fallback_reason"])
+        self.assertEqual(len(workers), 2)
+        # The failed retry started a new cooldown: the next batch does not retry.
+        runtime.encode(["a", "b", "c"])
+        self.assertEqual(len(workers), 2)
+
+    def test_manual_cuda_switch_retries_during_the_cooldown(self) -> None:
+        runtime, workers = self._retry_runtime([False, True])
+
+        runtime.encode(["fallback"])
+        self.assertEqual(runtime.runtime_status()["loaded_device"], "cpu")
+
+        runtime.switch_device("cuda")
+
+        self.assertEqual(runtime.runtime_status()["loaded_device"], "cuda")
+        self.assertIsNone(runtime.runtime_status()["cuda_fallback_reason"])
+        self.assertEqual(len(workers), 2)
+
+    @staticmethod
+    def _cuda_retry_seconds() -> float:
+        return Settings.from_env().cuda_retry_seconds
+
     def test_encode_splits_static_batch_size_by_available_vram_cap(self) -> None:
         workers: list[FakeWorker] = []
 

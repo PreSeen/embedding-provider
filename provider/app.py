@@ -942,6 +942,7 @@ class EmbedderRuntime:
         self._idle_offload_enabled = self._detected_device == "cuda" and settings.idle_offload_seconds > 0
         self._stats: ProviderRuntimeStats | None = None
         self._cuda_fallback_reason: str | None = None
+        self._cuda_fallback_at: float | None = None
 
     def attach_stats(self, stats: ProviderRuntimeStats) -> None:
         self._stats = stats
@@ -1006,6 +1007,7 @@ class EmbedderRuntime:
                 "start_device": self._settings.start_device,
                 "engine_state": self._engine_state,
                 "cuda_fallback_reason": self._cuda_fallback_reason,
+                "cuda_retry_in_seconds": self._cuda_retry_remaining_locked(),
                 "idle_offload_enabled": self._idle_offload_enabled,
                 "idle_offload_seconds": self._settings.idle_offload_seconds if self._idle_offload_enabled else None,
                 "idle_offload_poll_seconds": (
@@ -1131,7 +1133,7 @@ class EmbedderRuntime:
             self._settings.cpu_to_gpu_scale_up_texts <= 0
             or text_count < self._settings.cpu_to_gpu_scale_up_texts
             or self._detected_device != "cuda"
-            or self._cuda_fallback_reason is not None
+            or self._cuda_retry_remaining() is not None
         ):
             return
         cooldown_remaining = self._device_switch_cooldown_remaining()
@@ -1195,8 +1197,6 @@ class EmbedderRuntime:
     def _switch_to_cuda(self, *, wait_for_idle: bool) -> None:
         if self._detected_device != "cuda":
             raise RuntimeError("CUDA is not available for this runtime")
-        if self._cuda_fallback_reason is not None:
-            raise RuntimeError(f"CUDA fallback is active: {self._cuda_fallback_reason}")
         with self._model_lock:
             while self._reload_in_progress or (wait_for_idle and self._inflight_encodes > 0):
                 self._model_lock.wait()
@@ -1224,6 +1224,10 @@ class EmbedderRuntime:
                 self._last_offloaded_at = None
                 self._last_device_switch_at = time.monotonic()
                 self._gpu_low_batch_since = None
+                # A start that works again ends the CPU fallback and restores idle offload.
+                self._cuda_fallback_reason = None
+                self._cuda_fallback_at = None
+                self._idle_offload_enabled = self._settings.idle_offload_seconds > 0
             if old_model is not None:
                 del old_model
                 gc.collect()
@@ -1284,6 +1288,19 @@ class EmbedderRuntime:
             self._last_offloaded_at = None
             self._idle_offload_enabled = False
             self._cuda_fallback_reason = reason
+            self._cuda_fallback_at = time.monotonic()
+
+    def _cuda_retry_remaining_locked(self) -> float | None:
+        """Seconds until the CPU fallback may be retried on CUDA; None when no fallback is active."""
+        if self._cuda_fallback_reason is None or self._cuda_fallback_at is None:
+            return None
+        return max(0.0, self._cuda_fallback_at + self._settings.cuda_retry_seconds - time.monotonic())
+
+    def _cuda_retry_remaining(self) -> float | None:
+        """Like the locked variant, but None also once the cooldown is over (retry allowed)."""
+        with self._model_lock:
+            remaining = self._cuda_retry_remaining_locked()
+        return remaining if remaining else None
 
     def _swap_model(self, next_model: Any, next_device: str, *, engine_state: str) -> None:
         if self._use_gpu_worker:

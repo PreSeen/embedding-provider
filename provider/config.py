@@ -60,6 +60,7 @@ class Settings:
     cuda_vram_safety_fixed_mb: int = 512
     cuda_vram_safety_total_ratio: float = 0.05
     gpu_forward_concurrency: int = 1
+    cuda_retry_seconds: float = 300.0
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -93,4 +94,5 @@ class Settings:
             cuda_vram_safety_fixed_mb=_env_int("CUDA_VRAM_SAFETY_FIXED_MB", "512") or 512,
             cuda_vram_safety_total_ratio=_env_float("CUDA_VRAM_SAFETY_TOTAL_RATIO", "0.05"),
             gpu_forward_concurrency=_positive_env_int("GPU_FORWARD_CONCURRENCY", "1"),
+            cuda_retry_seconds=_env_float("CUDA_RETRY_SECONDS", "300"),
         )

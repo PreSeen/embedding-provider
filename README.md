@@ -107,6 +107,7 @@ On CUDA hosts, the provider now keeps the HTTP process alive but moves the loade
 - `CPU_TO_GPU_SCALE_UP_TEXTS`: queued/requested text count threshold that promotes CPU to CUDA
 - `GPU_TO_CPU_SCALE_DOWN_TEXTS`: sustained small CUDA batch threshold used for scale-down
 - `GPU_TO_CPU_SCALE_DOWN_SECONDS`: how long small CUDA batches must persist before CPU scale-down
+- `CUDA_RETRY_SECONDS` (default `300`): after the GPU worker fails to start (for example CUDA OOM because another service holds the VRAM) the runtime serves from CPU; after this many seconds the next batch of `CPU_TO_GPU_SCALE_UP_TEXTS` or more texts retries CUDA. A successful start ends the fallback and re-enables idle offload; a failed retry starts the wait again. `POST /admin/device` with `cuda` retries immediately. `/statsz` shows `cuda_fallback_reason` and `cuda_retry_in_seconds`.
 - `REQUEST_LOG_LIMIT`: in-memory request/input log retention limit
 - `EMBEDDING_CACHE_LIMIT`: in-memory exact-match embedding cache entry limit
 - `CUDA_BATCH_GROWTH_FACTOR`: multiplier used when CUDA target grows after full successful dispatches
