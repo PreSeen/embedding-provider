@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import os
 import sys
 import types
@@ -100,6 +101,7 @@ class FakeWorker:
         self.starts = 0
         self.stops = 0
         self.batch_sizes: list[int] = []
+        self.prompt_names: list[str | None] = []
         self.cache_releases = 0
 
     @property
@@ -114,9 +116,17 @@ class FakeWorker:
         self.starts += 1
         return "cuda"
 
-    def encode(self, texts: list[str], *, dimensions: int | None = None, task: str | None = None):
+    def encode(
+        self,
+        texts: list[str],
+        *,
+        dimensions: int | None = None,
+        task: str | None = None,
+        prompt_name: str | None = None,
+    ):
         self.ensure_started()
         self.batch_sizes.append(len(texts))
+        self.prompt_names.append(prompt_name)
         width = dimensions or 4
         return np.ones((len(texts), width), dtype=np.float32).tolist(), 1024.0
 
@@ -140,7 +150,14 @@ class TransientOomWorker(FakeWorker):
         super().__init__(settings)
         self.failures_remaining = 1
 
-    def encode(self, texts: list[str], *, dimensions: int | None = None, task: str | None = None):
+    def encode(
+        self,
+        texts: list[str],
+        *,
+        dimensions: int | None = None,
+        task: str | None = None,
+        prompt_name: str | None = None,
+    ):
         self.ensure_started()
         if self.failures_remaining > 0:
             self.failures_remaining -= 1
@@ -235,6 +252,48 @@ class EmbedderRuntimeIdleOffloadTests(unittest.TestCase):
         self.assertGreaterEqual(workers[0].starts, 1)
         self.assertGreaterEqual(workers[0].stops, 1)
         self.assertGreaterEqual(workers[1].starts, 1)
+
+    def test_prompt_name_reaches_gpu_worker_and_cpu_model_only_when_requested(self) -> None:
+        worker_holder: list[FakeWorker] = []
+
+        def fake_worker_factory(settings: Settings) -> FakeWorker:
+            worker = FakeWorker(settings)
+            worker_holder.append(worker)
+            return worker
+
+        with (
+            patch("provider.app._GpuEmbedderWorker", side_effect=fake_worker_factory),
+            patch("provider.app._detect_preferred_device", return_value="cuda"),
+            patch("provider.app._probe_cuda_memory_bytes", return_value=(8 * 1024**3, 24 * 1024**3)),
+        ):
+            runtime = EmbedderRuntime(Settings.from_env())
+            runtime.encode(["q"], task="retrieval", prompt_name="query")
+            runtime.encode(["d"], task="retrieval")
+            runtime.close()
+        self.assertEqual(worker_holder[0].prompt_names, ["query", None])
+
+        seen: list[dict[str, object]] = []
+
+        class PromptModel:
+            def encode(self, texts, task, prompt_name="document", truncate_dim=None):
+                seen.append({"task": task, "prompt_name": prompt_name})
+                return np.ones((len(texts), 4), dtype=np.float32)
+
+        class PlainModel:
+            def encode(self, texts, task=None):
+                seen.append({"task": task})
+                return np.ones((len(texts), 4), dtype=np.float32)
+
+        with patch("provider.app._detect_preferred_device", return_value="cpu"):
+            runtime = EmbedderRuntime(Settings.from_env())
+            for model in (PromptModel(), PlainModel()):
+                runtime._model = model
+                runtime._encode_signature = inspect.signature(model.encode)
+                runtime.encode(["q"], task="retrieval", prompt_name="query")
+        self.assertEqual(
+            seen,
+            [{"task": "retrieval", "prompt_name": "query"}, {"task": "retrieval"}],
+        )
 
     def test_low_batch_scale_down_runs_without_follow_up_request(self) -> None:
         workers: list[FakeWorker] = []

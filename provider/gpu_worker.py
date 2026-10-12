@@ -135,10 +135,13 @@ def _handle_request(
     texts = [str(item) for item in request.get("texts") or []]
     dimensions = request.get("dimensions")
     task = request.get("task") or settings.embedding_task
+    prompt_name = request.get("prompt_name")
     kwargs: dict[str, Any] = {}
     input_name = "texts" if "texts" in encode_signature.parameters else "sentences"
     if task and "task" in encode_signature.parameters:
         kwargs["task"] = str(task)
+    if prompt_name and "prompt_name" in encode_signature.parameters:
+        kwargs["prompt_name"] = str(prompt_name)
     if dimensions and "truncate_dim" in encode_signature.parameters:
         kwargs["truncate_dim"] = int(dimensions)
     if settings.max_length and "max_length" in encode_signature.parameters:

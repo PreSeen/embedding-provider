@@ -34,6 +34,13 @@ logging.basicConfig(level="INFO")
 
 _BYTES_PER_MIB = 1024 * 1024
 
+PromptName = Literal["query", "document"]
+
+
+def _prompt_prefix(prompt_name: str | None) -> str:
+    """The text prefix the Jina v5 models put in front of each input (document is their default)."""
+    return "Query: " if prompt_name == "query" else "Document: "
+
 
 def _batched(values: list[str], batch_size: int) -> list[list[str]]:
     if batch_size <= 0:
@@ -275,6 +282,7 @@ class RequestLogBuffer:
         dimensions: int | None,
         task: str | None,
         texts: list[str],
+        prompt_name: str | None = None,
     ) -> None:
         now_epoch = time.time()
         now_iso = _utc_now_iso()
@@ -287,6 +295,7 @@ class RequestLogBuffer:
             "model": model,
             "dimensions": dimensions,
             "task": task,
+            "prompt_name": prompt_name,
             "text_count": len(texts),
             "status": "running",
             "status_code": None,
@@ -303,6 +312,7 @@ class RequestLogBuffer:
                 "model": model,
                 "dimensions": dimensions,
                 "task": task,
+                "prompt_name": prompt_name,
                 "input": text,
             }
             for idx, text in enumerate(texts)
@@ -408,7 +418,7 @@ class RequestLogBuffer:
         return buckets
 
 
-EmbeddingCacheKey = tuple[str, int | None, str | None, str]
+EmbeddingCacheKey = tuple[str, int | None, str | None, str | None, str]
 
 
 class EmbeddingResultCache:
@@ -585,6 +595,7 @@ class EmbeddingRequest(BaseModel):
     encoding_format: Literal["float"] | None = "float"
     user: str | None = None
     task: str | None = None
+    prompt_name: PromptName | None = None
 
 
 class EmbeddingItem(BaseModel):
@@ -628,12 +639,13 @@ class InputLengthValidator:
     def max_length(self) -> int | None:
         return self._settings.max_length
 
-    def token_counts(self, texts: list[str]) -> list[int]:
+    def token_counts(self, texts: list[str], prompt_name: str | None = None) -> list[int]:
         tokenizer = self._get_tokenizer()
+        prefix = _prompt_prefix(prompt_name)
         counts: list[int] = []
         for text in texts:
             encoded = tokenizer(
-                f"Document: {text}",
+                f"{prefix}{text}",
                 add_special_tokens=True,
                 truncation=False,
                 return_attention_mask=False,
@@ -642,11 +654,11 @@ class InputLengthValidator:
             counts.append(len(encoded["input_ids"]))
         return counts
 
-    def validate(self, texts: list[str]) -> list[int]:
+    def validate(self, texts: list[str], prompt_name: str | None = None) -> list[int]:
         max_length = self.max_length
         if not max_length:
             return []
-        counts = self.token_counts(texts)
+        counts = self.token_counts(texts, prompt_name)
         for index, count in enumerate(counts):
             if count > max_length:
                 raise HTTPException(
@@ -658,17 +670,21 @@ class InputLengthValidator:
                 )
         return counts
 
-    def truncate_over_limit(self, texts: list[str]) -> tuple[list[str], list[EmbeddingWarning], list[int]]:
+    def truncate_over_limit(
+        self,
+        texts: list[str],
+        prompt_name: str | None = None,
+    ) -> tuple[list[str], list[EmbeddingWarning], list[int]]:
         max_length = self.max_length
         if not max_length:
             return texts, [], []
-        counts = self.token_counts(texts)
+        counts = self.token_counts(texts, prompt_name)
         truncated = list(texts)
         warnings: list[EmbeddingWarning] = []
         for index, count in enumerate(counts):
             if count <= max_length:
                 continue
-            truncated_text, truncated_count = self._truncate_text_to_token_limit(texts[index], max_length)
+            truncated_text, truncated_count = self._truncate_text_to_token_limit(texts[index], max_length, prompt_name)
             truncated[index] = truncated_text
             warnings.append(
                 EmbeddingWarning(
@@ -684,15 +700,20 @@ class InputLengthValidator:
             )
         return truncated, warnings, counts
 
-    def _truncate_text_to_token_limit(self, text: str, max_length: int) -> tuple[str, int]:
+    def _truncate_text_to_token_limit(
+        self,
+        text: str,
+        max_length: int,
+        prompt_name: str | None = None,
+    ) -> tuple[str, int]:
         low = 0
         high = len(text)
         best_text = ""
-        best_count = self.token_counts([""])[0]
+        best_count = self.token_counts([""], prompt_name)[0]
         while low <= high:
             mid = (low + high) // 2
             candidate = text[:mid].rstrip()
-            count = self.token_counts([candidate])[0]
+            count = self.token_counts([candidate], prompt_name)[0]
             if count <= max_length:
                 best_text = candidate
                 best_count = count
@@ -802,6 +823,7 @@ class _GpuEmbedderWorker:
         *,
         dimensions: int | None = None,
         task: str | None = None,
+        prompt_name: str | None = None,
     ) -> tuple[list[list[float]], float | None]:
         effective_task = task or self._settings.embedding_task
         with self._forward_slots:
@@ -811,6 +833,7 @@ class _GpuEmbedderWorker:
                     "texts": texts,
                     "dimensions": dimensions,
                     "task": effective_task,
+                    "prompt_name": prompt_name,
                 }
             )
         embeddings = [[float(value) for value in row] for row in response.get("embeddings") or []]
@@ -1350,7 +1373,14 @@ class EmbedderRuntime:
 
                 torch.cuda.empty_cache()
 
-    def _encode_once(self, texts: list[str], *, dimensions: int | None = None, task: str | None = None) -> list[list[float]]:
+    def _encode_once(
+        self,
+        texts: list[str],
+        *,
+        dimensions: int | None = None,
+        task: str | None = None,
+        prompt_name: str | None = None,
+    ) -> list[list[float]]:
         if self._use_gpu_worker:
             if self._gpu_worker is None:
                 raise RuntimeError("embedding GPU worker is unavailable")
@@ -1358,7 +1388,7 @@ class EmbedderRuntime:
                 device_name = self._gpu_worker.ensure_started()
             except Exception as exc:
                 self._fallback_to_cpu(exc)
-                return self._encode_once(texts, dimensions=dimensions, task=task)
+                return self._encode_once(texts, dimensions=dimensions, task=task, prompt_name=prompt_name)
             with self._model_lock:
                 self._device = device_name
                 self.device_name = device_name
@@ -1371,7 +1401,9 @@ class EmbedderRuntime:
                     self._gpu_forwards_in_flight,
                 )
             try:
-                embeddings, sample = self._gpu_worker.encode(texts, dimensions=dimensions, task=task)
+                embeddings, sample = self._gpu_worker.encode(
+                    texts, dimensions=dimensions, task=task, prompt_name=prompt_name
+                )
             finally:
                 with self._model_lock:
                     self._gpu_forwards_in_flight -= 1
@@ -1389,6 +1421,8 @@ class EmbedderRuntime:
         effective_task = task or self._settings.embedding_task
         if effective_task and "task" in self._encode_signature.parameters:
             kwargs["task"] = effective_task
+        if prompt_name and "prompt_name" in self._encode_signature.parameters:
+            kwargs["prompt_name"] = prompt_name
         if requested_dimensions and "truncate_dim" in self._encode_signature.parameters:
             kwargs["truncate_dim"] = requested_dimensions
         if self._settings.max_length and "max_length" in self._encode_signature.parameters:
@@ -1440,10 +1474,11 @@ class EmbedderRuntime:
         *,
         dimensions: int | None = None,
         task: str | None = None,
+        prompt_name: str | None = None,
     ) -> _EncodeResult:
         try:
             return _EncodeResult(
-                embeddings=self._encode_once(texts, dimensions=dimensions, task=task),
+                embeddings=self._encode_once(texts, dimensions=dimensions, task=task, prompt_name=prompt_name),
                 max_forward_texts=len(texts),
             )
         except RuntimeError as exc:
@@ -1479,7 +1514,9 @@ class EmbedderRuntime:
                         self.device_name,
                     )
                     return _EncodeResult(
-                        embeddings=self._encode_once(texts, dimensions=dimensions, task=task),
+                        embeddings=self._encode_once(
+                            texts, dimensions=dimensions, task=task, prompt_name=prompt_name
+                        ),
                         max_forward_texts=1,
                         had_oom_backoff=True,
                     )
@@ -1509,8 +1546,12 @@ class EmbedderRuntime:
                 self._settings.model_id,
                 len(texts),
             )
-            left = self._encode_with_backoff(texts[:split_at], dimensions=dimensions, task=task)
-            right = self._encode_with_backoff(texts[split_at:], dimensions=dimensions, task=task)
+            left = self._encode_with_backoff(
+                texts[:split_at], dimensions=dimensions, task=task, prompt_name=prompt_name
+            )
+            right = self._encode_with_backoff(
+                texts[split_at:], dimensions=dimensions, task=task, prompt_name=prompt_name
+            )
             return _EncodeResult(
                 embeddings=[*left.embeddings, *right.embeddings],
                 max_forward_texts=max(left.max_forward_texts, right.max_forward_texts),
@@ -1529,6 +1570,7 @@ class EmbedderRuntime:
         *,
         dimensions: int | None = None,
         task: str | None = None,
+        prompt_name: str | None = None,
         allow_batch_growth: bool = False,
     ) -> list[list[float]]:
         self._begin_encode(len(texts))
@@ -1547,7 +1589,7 @@ class EmbedderRuntime:
                     chunk_target = min(max_batch_size, self.adaptive_batch.effective_target(vram_cap=vram_cap))
                 chunk_size = max(1, min(chunk_target, remaining))
                 chunk = texts[offset: offset + chunk_size]
-                result = self._encode_with_backoff(chunk, dimensions=dimensions, task=task)
+                result = self._encode_with_backoff(chunk, dimensions=dimensions, task=task, prompt_name=prompt_name)
                 embeddings.extend(result.embeddings)
                 offset += chunk_size
                 if self._preferred_device == "cuda":
@@ -1649,6 +1691,7 @@ class _PendingItem:
     state: _PendingRequestState
     enqueued_at: float
     request_id: str
+    prompt_name: str | None = None
 
 
 class ContinuousBatcher:
@@ -1687,6 +1730,7 @@ class ContinuousBatcher:
         *,
         dimensions: int | None = None,
         task: str | None = None,
+        prompt_name: str | None = None,
         request_id: str,
     ) -> list[list[float]]:
         loop = asyncio.get_running_loop()
@@ -1704,6 +1748,7 @@ class ContinuousBatcher:
                     input_index=input_index,
                     dimensions=dimensions,
                     task=task,
+                    prompt_name=prompt_name,
                     state=state,
                     enqueued_at=enqueued_at,
                     request_id=request_id,
@@ -1762,14 +1807,14 @@ class ContinuousBatcher:
         if not batch:
             return []
 
-        # Group by (task, dimensions) — in practice almost always one group.
+        # Group by (task, prompt_name, dimensions) — in practice almost always one group.
         groups: dict[tuple, list[_PendingItem]] = defaultdict(list)
         for item in batch:
-            groups[(item.task, item.dimensions)].append(item)
+            groups[(item.task, item.prompt_name, item.dimensions)].append(item)
 
         overflow: list[_PendingItem] = []
 
-        for (task, dimensions), items in groups.items():
+        for (task, prompt_name, dimensions), items in groups.items():
             # Cap this group by available VRAM; overflow is deferred to next iteration.
             max_texts = max(1, self._runtime.estimate_max_texts())
             if observe_demand and getattr(self._runtime, "_preferred_device", None) == "cuda":
@@ -1786,8 +1831,8 @@ class ContinuousBatcher:
             lanes = [to_process[index:index + lane_size] for index in range(0, text_count, lane_size)]
 
             log.info(
-                "batch dispatch: requests=%d texts=%d overflow=%d lanes=%d task=%s dim=%s",
-                len({item.request_id for item in to_process}), text_count, group_overflow, len(lanes), task, dimensions,
+                "batch dispatch: requests=%d texts=%d overflow=%d lanes=%d task=%s prompt=%s dim=%s",
+                len({item.request_id for item in to_process}), text_count, group_overflow, len(lanes), task, prompt_name, dimensions,
             )
             self._stats.record_batch_dispatch(request_count=len({item.request_id for item in to_process}), text_count=text_count)
             self._stats.set_running_batch(text_count=text_count)
@@ -1797,6 +1842,7 @@ class ContinuousBatcher:
                     [item.text for item in lane],
                     dimensions=dimensions,
                     task=task,
+                    prompt_name=prompt_name,
                     allow_batch_growth=group_overflow > 0 and len(lanes) == 1,
                 )
                 return lane, await loop.run_in_executor(None, fn)
@@ -2408,13 +2454,16 @@ def create_app(settings: Settings | None = None, runtime: EmbedderRuntime | None
             model=request.model,
             dimensions=request.dimensions,
             task=request.task,
+            prompt_name=request.prompt_name,
             texts=texts,
         )
         stats.record_request_start(request_id=request_id, text_count=len(texts))
         started_at = time.perf_counter()
-        texts_for_embedding, input_warnings, _token_counts = input_length_validator.truncate_over_limit(texts)
+        texts_for_embedding, input_warnings, _token_counts = input_length_validator.truncate_over_limit(
+            texts, request.prompt_name
+        )
         usage_token_count = (
-            sum(input_length_validator.token_counts(texts_for_embedding))
+            sum(input_length_validator.token_counts(texts_for_embedding, request.prompt_name))
             if input_length_validator.max_length
             else _estimate_tokens(texts_for_embedding)
         )
@@ -2426,16 +2475,17 @@ def create_app(settings: Settings | None = None, runtime: EmbedderRuntime | None
                 [warning.dict() for warning in input_warnings],
             )
         log.info(
-            "embedding request started request_id=%s texts=%d dimensions=%s task=%s",
+            "embedding request started request_id=%s texts=%d dimensions=%s task=%s prompt_name=%s",
             request_id,
             len(texts),
             request.dimensions,
             request.task,
+            request.prompt_name,
         )
         effective_dimensions = request.dimensions or resolved_settings.default_dimensions
         effective_task = request.task or resolved_settings.embedding_task
         cache_keys: list[EmbeddingCacheKey] = [
-            (resolved_settings.model_id, effective_dimensions, effective_task, text)
+            (resolved_settings.model_id, effective_dimensions, effective_task, request.prompt_name, text)
             for text in texts_for_embedding
         ]
         cached_embeddings = embedding_cache.get_many(cache_keys)
@@ -2447,6 +2497,7 @@ def create_app(settings: Settings | None = None, runtime: EmbedderRuntime | None
                     miss_texts,
                     dimensions=request.dimensions,
                     task=request.task,
+                    prompt_name=request.prompt_name,
                     request_id=request_id,
                 )
                 embedding_cache.set_many(

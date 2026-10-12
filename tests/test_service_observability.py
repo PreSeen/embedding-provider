@@ -144,6 +144,7 @@ class FakeRuntime:
         *,
         dimensions: int | None = None,
         task: str | None = None,
+        prompt_name: str | None = None,
         allow_batch_growth: bool = False,
     ) -> list[list[float]]:
         if self.fail_with is not None:
@@ -615,9 +616,9 @@ def test_request_log_buffer_keeps_recent_inputs_and_qps_buckets() -> None:
 def test_embedding_result_cache_eviction_and_snapshot() -> None:
     cache = EmbeddingResultCache(max_entries=2)
     keys = [
-        ("model", 4, "task", "alpha"),
-        ("model", 4, "task", "beta"),
-        ("model", 4, "task", "gamma"),
+        ("model", 4, "task", None, "alpha"),
+        ("model", 4, "task", None, "beta"),
+        ("model", 4, "task", None, "gamma"),
     ]
     cache.set_many([(keys[0], [1.0]), (keys[1], [2.0])])
     assert cache.get_many([keys[0]]) == [[1.0]]
@@ -636,3 +637,158 @@ def test_country_for_ip_identifies_local_networks() -> None:
     assert _country_for_ip("127.0.0.1") == "localhost"
     assert _country_for_ip("192.168.1.10") == "LAN"
     assert _country_for_ip("not-an-ip") == "unknown"
+
+
+def test_embeddings_forwards_prompt_name_and_separates_cache_by_prompt_name() -> None:
+    class RecordingRuntime(FakeRuntime):
+        def __post_init__(self) -> None:
+            super().__post_init__()
+            self.calls: list[tuple[str | None, str | None, list[str]]] = []
+
+        def encode(self, texts: list[str], **kwargs: Any) -> list[list[float]]:
+            self.calls.append((kwargs.get("task"), kwargs.get("prompt_name"), list(texts)))
+            return [[1.0] * 4 for _ in texts]
+
+    runtime = RecordingRuntime()
+    app = create_app(settings=_settings(), runtime=runtime)
+    headers = {"Authorization": "Bearer test-key"}
+    with TestClient(app) as client:
+        for prompt_name in ("query", "document", "query"):
+            response = client.post(
+                "/v1/embeddings",
+                headers=headers,
+                json={"input": ["alpha"], "task": "retrieval", "prompt_name": prompt_name},
+            )
+            assert response.status_code == 200
+
+    # the second "query" is a cache hit; "query" and "document" never share an entry
+    assert runtime.calls == [
+        ("retrieval", "query", ["alpha"]),
+        ("retrieval", "document", ["alpha"]),
+    ]
+
+
+def test_embeddings_rejects_unknown_prompt_name() -> None:
+    app = create_app(settings=_settings(), runtime=FakeRuntime())
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/embeddings",
+            headers={"Authorization": "Bearer test-key"},
+            json={"input": ["alpha"], "prompt_name": "passage"},
+        )
+    assert response.status_code == 422
+
+
+def test_continuous_batcher_groups_items_by_prompt_name() -> None:
+    class RecordingRuntime(FakeRuntime):
+        def __post_init__(self) -> None:
+            super().__post_init__()
+            self.calls: list[tuple[str | None, list[str]]] = []
+
+        def encode(self, texts: list[str], **kwargs: Any) -> list[list[float]]:
+            self.calls.append((kwargs.get("prompt_name"), list(texts)))
+            return [[1.0] for _ in texts]
+
+    runtime = RecordingRuntime()
+
+    async def run_batch() -> None:
+        batcher = ContinuousBatcher(runtime, ProviderRuntimeStats(), window_secs=0.001)
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[list[list[float]]] = loop.create_future()
+        state = _PendingRequestState(future=future, embeddings=[None] * 3, remaining=3)
+        now = time.monotonic()
+        items = [
+            _PendingItem(
+                text=text,
+                input_index=index,
+                dimensions=1,
+                task="retrieval",
+                prompt_name=prompt_name,
+                state=state,
+                enqueued_at=now,
+                request_id="prompt-name-test",
+            )
+            for index, (text, prompt_name) in enumerate([("a", "query"), ("b", "document"), ("c", "query")])
+        ]
+        await batcher._dispatch(items, loop, observe_demand=True)
+        await future
+
+    asyncio.run(run_batch())
+    assert sorted(runtime.calls) == [("document", ["b"]), ("query", ["a", "c"])]
+
+
+def test_input_length_validator_counts_query_prefix_instead_of_document_prefix() -> None:
+    seen: list[str] = []
+
+    class RecordingTokenizer:
+        def __call__(self, text: str, **kwargs: Any) -> dict[str, list[str]]:
+            seen.append(text)
+            return {"input_ids": text.split()}
+
+    validator = InputLengthValidator(_settings())
+    validator._tokenizer = RecordingTokenizer()
+
+    validator.token_counts(["hello"])
+    validator.token_counts(["hello"], prompt_name="query")
+    validator.token_counts(["hello"], prompt_name="document")
+
+    assert seen == ["Document: hello", "Query: hello", "Document: hello"]
+
+
+def test_gpu_worker_client_sends_prompt_name_to_worker_process() -> None:
+    worker = _GpuEmbedderWorker(_settings())
+    sent: list[dict[str, Any]] = []
+
+    def fake_request(payload: dict[str, Any]) -> dict[str, Any]:
+        sent.append(payload)
+        return {"status": "ok", "embeddings": [[1.0]], "sample_bytes_per_text": None}
+
+    worker._request = fake_request  # type: ignore[method-assign]
+    worker.encode(["alpha"], task="retrieval", prompt_name="query")
+
+    assert sent[0]["task"] == "retrieval"
+    assert sent[0]["prompt_name"] == "query"
+
+
+def test_gpu_worker_process_passes_prompt_name_only_when_model_accepts_it() -> None:
+    from provider.gpu_worker import serve_requests
+
+    seen: list[dict[str, Any]] = []
+
+    class PromptModel:
+        def encode(self, texts: list[str], task: str, prompt_name: str | None = "document") -> list[list[float]]:
+            seen.append({"task": task, "prompt_name": prompt_name})
+            return [[float(len(text))] for text in texts]
+
+    class PlainModel:
+        def encode(self, texts: list[str]) -> list[list[float]]:
+            seen.append({})
+            return [[float(len(text))] for text in texts]
+
+    settings = replace(_settings(), normalize_embeddings=False)
+    requests = [
+        json.dumps({"id": "one", "op": "encode", "texts": ["a"], "task": "retrieval", "prompt_name": "query"}),
+        json.dumps({"op": "shutdown"}),
+    ]
+    responses: list[dict[str, object]] = []
+    serve_requests(requests, model=PromptModel(), settings=settings, emit=responses.append)
+    serve_requests(requests, model=PlainModel(), settings=settings, emit=responses.append)
+
+    assert seen == [{"task": "retrieval", "prompt_name": "query"}, {}]
+    assert all(response.get("status") == "ok" for response in responses if response.get("id"))
+
+
+def test_request_log_buffer_records_prompt_name() -> None:
+    log = RequestLogBuffer(max_inputs=3, max_requests=3)
+    log.record_start(
+        request_id="req-1",
+        source_ip=None,
+        source_country="unknown",
+        model="model-a",
+        dimensions=4,
+        task="retrieval",
+        prompt_name="query",
+        texts=["alpha"],
+    )
+    assert log.recent_inputs(limit=1)[0]["prompt_name"] == "query"
+    assert log.recent_requests(limit=1)[0]["prompt_name"] == "query"

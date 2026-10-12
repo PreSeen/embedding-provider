@@ -64,6 +64,33 @@ curl -X POST http://127.0.0.1:8000/v1/embeddings \
   }'
 ```
 
+## Retrieval Mode (`task` + `prompt_name`)
+
+Jina v5 models carry four LoRA adapters (`retrieval`, `text-matching`, `clustering`, `classification`) and two input prefixes. The two request fields are independent:
+
+- `task` picks the LoRA adapter (default `EMBEDDING_TASK`, `text-matching` in the shipped env files).
+- `prompt_name` picks the prefix the model puts in front of every input: `query` -> `Query: `, `document` -> `Document: `. When it is omitted the model default (`document`) applies, so existing callers keep their vectors.
+
+For asymmetric search, embed the corpus and the queries with the same `task` and `dimensions`, and differ only in `prompt_name`:
+
+```bash
+# index side
+curl -X POST http://127.0.0.1:8000/v1/embeddings -H "Authorization: Bearer change-me" \
+  -H "Content-Type: application/json" \
+  -d '{"input": ["Alice leads Project Alpha"], "task": "retrieval", "prompt_name": "document"}'
+
+# query side
+curl -X POST http://127.0.0.1:8000/v1/embeddings -H "Authorization: Bearer change-me" \
+  -H "Content-Type: application/json" \
+  -d '{"input": ["who leads Alpha?"], "task": "retrieval", "prompt_name": "query"}'
+```
+
+Notes:
+
+- Vectors from different adapters are not comparable. Moving a corpus from `text-matching` to `retrieval` means re-embedding it; never mix adapters between the two sides.
+- `prompt_name` is only passed to models whose `encode()` accepts it (Jina v5). Other models ignore it. Any value other than `query` / `document` is rejected with 422.
+- The embedding cache, the batcher grouping, `MAX_LENGTH` token counting/truncation, and the request log all include `prompt_name`.
+
 Observability endpoints:
 
 ```bash
