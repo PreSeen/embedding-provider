@@ -12,3 +12,11 @@ deployments/**/*.env
 deployments/**/*.env.bak
 deployments/**/*.env.bak.*
 *.env.local
+
+# Terraform (deployments/cloudflare-lb): real values and state hold tunnel secrets
+*.tfvars
+!*.tfvars.example
+*.tfstate
+*.tfstate.*
+.terraform/
+.terraform.lock.hcl

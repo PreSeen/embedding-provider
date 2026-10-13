@@ -1,0 +1,12 @@
+account_id = "REPLACE_WITH_ACCOUNT_ID"
+zone_id    = "REPLACE_WITH_ZONE_ID_FOR_preseen.ai"
+hostname   = "embed.preseen.ai"
+
+us_tunnel_id      = "REPLACE_WITH_EXISTING_embedding-provider-preseen-ai_TUNNEL_UUID"
+us_origin_address = "127.0.0.1"
+us_origin_port    = 7997
+
+# generate: openssl rand -base64 32
+cn_tunnel_secret  = "REPLACE_WITH_GENERATED_SECRET"
+cn_origin_address = "127.0.0.1"
+cn_origin_port    = 7997
