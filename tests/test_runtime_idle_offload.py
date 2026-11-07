@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 import os
 import sys
+import threading
 import types
 import unittest
 from contextlib import ExitStack
@@ -167,6 +168,25 @@ class TransientOomWorker(FakeWorker):
         return np.ones((len(texts), width), dtype=np.float32).tolist(), 1024.0
 
 
+class GatedStartWorker(FakeWorker):
+    """A worker whose start blocks until the test releases it, like a real model load."""
+
+    started = threading.Event()
+    release = threading.Event()
+    fail = False
+
+    def ensure_started(self) -> str:
+        if self.running:
+            return "cuda"
+        type(self).started.set()
+        if not type(self).release.wait(5):
+            raise RuntimeError("test never released the worker start")
+        if type(self).fail:
+            self.starts += 1
+            raise RuntimeError("CUDA out of memory while loading model")
+        return super().ensure_started()
+
+
 class EmbedderRuntimeIdleOffloadTests(unittest.TestCase):
     def setUp(self) -> None:
         self._env_stack = ExitStack()
@@ -242,6 +262,7 @@ class EmbedderRuntimeIdleOffloadTests(unittest.TestCase):
             self.assertEqual(runtime.runtime_status()["preferred_device"], "cpu")
 
             embeddings = runtime.encode(["hello world", "again", "third"])
+            self.assertTrue(runtime.wait_for_cuda_scale_up(5))
             self.assertEqual(len(embeddings), 3)
             self.assertEqual(runtime.runtime_status()["loaded_device"], "cuda")
             self.assertEqual(runtime.runtime_status()["preferred_device"], "cuda")
@@ -318,6 +339,7 @@ class EmbedderRuntimeIdleOffloadTests(unittest.TestCase):
             runtime = EmbedderRuntime(Settings.from_env())
             try:
                 runtime.encode(["one", "two", "three"])
+                self.assertTrue(runtime.wait_for_cuda_scale_up(5))
                 self.assertEqual(runtime.runtime_status()["loaded_device"], "cuda")
 
                 runtime.encode(["small"])
@@ -381,18 +403,21 @@ class EmbedderRuntimeIdleOffloadTests(unittest.TestCase):
             runtime = EmbedderRuntime(Settings.from_env())
             try:
                 runtime.encode(["one", "two", "three"])
+                self.assertTrue(runtime.wait_for_cuda_scale_up(5))
                 self.assertEqual(runtime.runtime_status()["loaded_device"], "cuda")
 
                 runtime._switch_to_cpu(mark_offload=True)
                 self.assertEqual(runtime.runtime_status()["loaded_device"], "cpu")
 
                 runtime.encode(["one", "two", "three"])
+                self.assertTrue(runtime.wait_for_cuda_scale_up(5))
                 status = runtime.runtime_status()
                 self.assertEqual(status["loaded_device"], "cpu")
                 self.assertGreater(status["device_switch_cooldown_remaining_seconds"], 0)
 
                 runtime._last_device_switch_at -= 31
                 runtime.encode(["one", "two", "three"])
+                self.assertTrue(runtime.wait_for_cuda_scale_up(5))
                 self.assertEqual(runtime.runtime_status()["loaded_device"], "cuda")
             finally:
                 runtime.close()
@@ -509,12 +534,14 @@ class EmbedderRuntimeIdleOffloadTests(unittest.TestCase):
 
         # Inside the cooldown a batch must not start another GPU worker.
         runtime.encode(["a", "b", "c"])
+        self.assertTrue(runtime.wait_for_cuda_scale_up(5))
         self.assertEqual(runtime.runtime_status()["loaded_device"], "cpu")
         self.assertEqual(len(workers), 1)
         self.assertGreater(runtime.runtime_status()["cuda_retry_in_seconds"], 0)
 
         runtime._cuda_fallback_at -= self._cuda_retry_seconds() + 1
         runtime.encode(["a", "b", "c"])
+        self.assertTrue(runtime.wait_for_cuda_scale_up(5))
 
         status = runtime.runtime_status()
         self.assertEqual(status["loaded_device"], "cuda")
@@ -530,6 +557,7 @@ class EmbedderRuntimeIdleOffloadTests(unittest.TestCase):
         runtime.encode(["fallback"])
         runtime._cuda_fallback_at -= self._cuda_retry_seconds() + 1
         runtime.encode(["a", "b", "c"])
+        self.assertTrue(runtime.wait_for_cuda_scale_up(5))
 
         status = runtime.runtime_status()
         self.assertEqual(status["loaded_device"], "cpu")
@@ -537,6 +565,7 @@ class EmbedderRuntimeIdleOffloadTests(unittest.TestCase):
         self.assertEqual(len(workers), 2)
         # The failed retry started a new cooldown: the next batch does not retry.
         runtime.encode(["a", "b", "c"])
+        self.assertTrue(runtime.wait_for_cuda_scale_up(5))
         self.assertEqual(len(workers), 2)
 
     def test_manual_cuda_switch_retries_during_the_cooldown(self) -> None:
@@ -690,6 +719,86 @@ class EmbedderRuntimeIdleOffloadTests(unittest.TestCase):
         self.assertEqual(workers[0].batch_sizes, [1, 2, 4, 1, 2, 5])
         self.assertEqual(workers[0].cache_releases, 0)
         self.assertEqual(status["adaptive_batch"]["current_target"], 8)
+
+
+    def _gated_runtime(self, *, fail: bool = False):
+        GatedStartWorker.started = threading.Event()
+        GatedStartWorker.release = threading.Event()
+        GatedStartWorker.fail = fail
+        workers: list[GatedStartWorker] = []
+
+        def fake_worker_factory(settings: Settings) -> GatedStartWorker:
+            worker = GatedStartWorker(settings)
+            workers.append(worker)
+            return worker
+
+        patches = ExitStack()
+        patches.enter_context(patch.dict(os.environ, {"START_DEVICE": "cpu"}))
+        patches.enter_context(patch("provider.app._GpuEmbedderWorker", side_effect=fake_worker_factory))
+        patches.enter_context(patch("provider.app._detect_preferred_device", return_value="cuda"))
+        patches.enter_context(
+            patch("provider.app._probe_cuda_memory_bytes", return_value=(8 * 1024**3, 24 * 1024**3))
+        )
+        self.addCleanup(patches.close)
+        self.addCleanup(GatedStartWorker.release.set)
+        runtime = EmbedderRuntime(Settings.from_env())
+        self.addCleanup(runtime.close)
+        return runtime, workers
+
+    def test_scale_up_serves_on_cpu_while_the_gpu_worker_loads(self) -> None:
+        runtime, workers = self._gated_runtime()
+
+        # The batch that triggers the scale-up returns from CPU without waiting for the load.
+        embeddings = runtime.encode(["one", "two", "three"])
+        self.assertEqual(len(embeddings), 3)
+        self.assertTrue(GatedStartWorker.started.wait(5))
+        status = runtime.runtime_status()
+        self.assertEqual(status["loaded_device"], "cpu")
+        self.assertTrue(status["cuda_scale_up_in_progress"])
+
+        # Later requests keep being served on CPU and do not start a second worker.
+        self.assertEqual(len(runtime.encode(["four", "five", "six"])), 3)
+        self.assertEqual(len(runtime.encode(["seven"])), 1)
+        self.assertEqual(len(workers), 1)
+        self.assertEqual(workers[0].batch_sizes, [])
+
+        GatedStartWorker.release.set()
+        self.assertTrue(runtime.wait_for_cuda_scale_up(5))
+        status = runtime.runtime_status()
+        self.assertEqual(status["loaded_device"], "cuda")
+        self.assertFalse(status["cuda_scale_up_in_progress"])
+
+        runtime.encode(["eight", "nine", "ten"])
+        self.assertEqual(sum(workers[0].batch_sizes), 3)
+
+    def test_failed_background_scale_up_keeps_serving_on_cpu(self) -> None:
+        runtime, workers = self._gated_runtime(fail=True)
+
+        with patch.object(runtime, "_load_model", wraps=runtime._load_model) as load_model:
+            runtime.encode(["one", "two", "three"])
+            GatedStartWorker.release.set()
+            self.assertTrue(runtime.wait_for_cuda_scale_up(5))
+            # Already on CPU: the failure must not reload or swap the CPU model.
+            load_model.assert_not_called()
+
+        status = runtime.runtime_status()
+        self.assertEqual(status["loaded_device"], "cpu")
+        self.assertIn("CUDA out of memory", status["cuda_fallback_reason"])
+        self.assertGreater(status["cuda_retry_in_seconds"], 0)
+        self.assertEqual(len(runtime.encode(["four", "five", "six"])), 3)
+        self.assertEqual(len(workers), 1)
+
+    def test_close_stops_a_worker_that_is_still_loading(self) -> None:
+        runtime, workers = self._gated_runtime()
+
+        runtime.encode(["one", "two", "three"])
+        self.assertTrue(GatedStartWorker.started.wait(5))
+        runtime.close()
+        GatedStartWorker.release.set()
+        self.assertTrue(runtime.wait_for_cuda_scale_up(5))
+
+        self.assertEqual(runtime.runtime_status()["loaded_device"], "cpu")
+        self.assertFalse(workers[0].running)
 
 
 if __name__ == "__main__":

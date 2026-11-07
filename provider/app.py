@@ -987,6 +987,10 @@ class EmbedderRuntime:
         self._stats: ProviderRuntimeStats | None = None
         self._cuda_fallback_reason: str | None = None
         self._cuda_fallback_at: float | None = None
+        # Automatic CPU->GPU scale-up loads the worker in this thread while requests stay on CPU.
+        self._cuda_scale_up_thread: threading.Thread | None = None
+        self._pending_gpu_worker: _GpuEmbedderWorker | None = None
+        self._closed = False
 
     def attach_stats(self, stats: ProviderRuntimeStats) -> None:
         self._stats = stats
@@ -1081,6 +1085,7 @@ class EmbedderRuntime:
                 "idle_for_seconds": round(idle_for, 3),
                 "offloaded_for_seconds": round(offloaded_for, 3) if offloaded_for is not None else None,
                 "reload_in_progress": self._reload_in_progress,
+                "cuda_scale_up_in_progress": self._cuda_scale_up_thread is not None,
                 "worker_pid": self._gpu_worker.pid if self._gpu_worker is not None and self._gpu_worker.is_running() else None,
                 "adaptive_batch": self.adaptive_batch.snapshot(),
             }
@@ -1097,8 +1102,12 @@ class EmbedderRuntime:
 
     def close(self) -> None:
         with self._model_lock:
+            self._closed = True
             while self._inflight_encodes > 0:
                 self._model_lock.wait()
+            pending = self._pending_gpu_worker
+        if pending is not None:
+            pending.terminate()
         if self._gpu_worker is not None:
             self._gpu_worker.terminate()
 
@@ -1185,7 +1194,74 @@ class EmbedderRuntime:
         if cooldown_remaining > 0:
             log.info("device switch cooldown active for %.1fs; deferring CUDA scale-up", cooldown_remaining)
             return
-        self._switch_to_cuda(wait_for_idle=False)
+        self._start_cuda_scale_up()
+
+    def _start_cuda_scale_up(self) -> None:
+        # Starting the GPU worker loads the model and takes tens of seconds. Doing it in the
+        # request path stalled every queued request until the load finished, so load it in the
+        # background and keep serving on CPU until the worker is ready.
+        with self._model_lock:
+            if (
+                self._closed
+                or self._cuda_scale_up_thread is not None
+                or self._reload_in_progress
+                or self._use_gpu_worker
+                or self.device_name != "cpu"
+            ):
+                return
+            thread = threading.Thread(target=self._run_cuda_scale_up, name="cuda-scale-up", daemon=True)
+            self._cuda_scale_up_thread = thread
+        thread.start()
+
+    def _run_cuda_scale_up(self) -> None:
+        worker = _GpuEmbedderWorker(self._settings)
+        with self._model_lock:
+            self._pending_gpu_worker = worker
+        try:
+            try:
+                device_name = worker.ensure_started()
+            except Exception as exc:
+                worker.terminate()
+                self._record_cuda_failure(exc)
+                return
+            with self._model_lock:
+                while self._reload_in_progress:
+                    self._model_lock.wait()
+                install = not self._closed and not self._use_gpu_worker and self.device_name == "cpu"
+                if install:
+                    self._reload_in_progress = True
+            if not install:
+                worker.terminate()
+                return
+            try:
+                self._install_gpu_worker(worker, device_name)
+            finally:
+                with self._model_lock:
+                    self._reload_in_progress = False
+                    self._model_lock.notify_all()
+        finally:
+            with self._model_lock:
+                self._pending_gpu_worker = None
+                self._cuda_scale_up_thread = None
+                self._model_lock.notify_all()
+
+    def wait_for_cuda_scale_up(self, timeout: float | None = None) -> bool:
+        """Wait for a background CPU->GPU scale-up; True when none is running anymore."""
+        with self._model_lock:
+            thread = self._cuda_scale_up_thread
+        if thread is None:
+            return True
+        thread.join(timeout)
+        return not thread.is_alive()
+
+    def _record_cuda_failure(self, exc: Exception) -> None:
+        # The runtime is still serving on CPU, so only remember the failure to delay retries.
+        reason = str(exc) or repr(exc)
+        log.warning("embedding GPU worker failed to start; staying on CPU: %s", reason)
+        with self._model_lock:
+            self._idle_offload_enabled = False
+            self._cuda_fallback_reason = reason
+            self._cuda_fallback_at = time.monotonic()
 
     def switch_device(self, target_device: str) -> dict[str, Any]:
         if target_device == "cpu":
@@ -1256,33 +1332,37 @@ class EmbedderRuntime:
                 worker.terminate()
                 self._fallback_to_cpu(exc)
                 return
-            with self._model_lock:
-                old_model = self._model
-                self._model = None
-                self._encode_signature = None
-                self._gpu_worker = worker
-                self._use_gpu_worker = True
-                self._preferred_device = "cuda"
-                self._device = device_name
-                self.device_name = device_name
-                self._engine_state = "hot"
-                self._last_offloaded_at = None
-                self._last_device_switch_at = time.monotonic()
-                self._gpu_low_batch_since = None
-                # A start that works again ends the CPU fallback and restores idle offload.
-                self._cuda_fallback_reason = None
-                self._cuda_fallback_at = None
-                self._idle_offload_enabled = self._settings.idle_offload_seconds > 0
-            if old_model is not None:
-                del old_model
-                gc.collect()
-            self.adaptive_batch.reset()
-            if self._stats is not None:
-                self._stats.record_reload()
+            self._install_gpu_worker(worker, device_name)
         finally:
             with self._model_lock:
                 self._reload_in_progress = False
                 self._model_lock.notify_all()
+
+    def _install_gpu_worker(self, worker: Any, device_name: str) -> None:
+        """Route encodes to a started GPU worker; the caller holds _reload_in_progress."""
+        with self._model_lock:
+            old_model = self._model
+            self._model = None
+            self._encode_signature = None
+            self._gpu_worker = worker
+            self._use_gpu_worker = True
+            self._preferred_device = "cuda"
+            self._device = device_name
+            self.device_name = device_name
+            self._engine_state = "hot"
+            self._last_offloaded_at = None
+            self._last_device_switch_at = time.monotonic()
+            self._gpu_low_batch_since = None
+            # A start that works again ends the CPU fallback and restores idle offload.
+            self._cuda_fallback_reason = None
+            self._cuda_fallback_at = None
+            self._idle_offload_enabled = self._settings.idle_offload_seconds > 0
+        if old_model is not None:
+            del old_model
+            gc.collect()
+        self.adaptive_batch.reset()
+        if self._stats is not None:
+            self._stats.record_reload()
 
     def _begin_encode(self, text_count: int) -> None:
         with self._model_lock:
@@ -1381,7 +1461,12 @@ class EmbedderRuntime:
         task: str | None = None,
         prompt_name: str | None = None,
     ) -> list[list[float]]:
-        if self._use_gpu_worker:
+        with self._model_lock:
+            use_gpu_worker = self._use_gpu_worker
+            model = self._model
+            encode_signature = self._encode_signature
+            preferred_device = self._preferred_device
+        if use_gpu_worker:
             if self._gpu_worker is None:
                 raise RuntimeError("embedding GPU worker is unavailable")
             try:
@@ -1414,30 +1499,30 @@ class EmbedderRuntime:
                     self._bytes_per_text_ema = self._ema_alpha * sample + (1 - self._ema_alpha) * self._bytes_per_text_ema
             return embeddings
         kwargs: dict[str, Any] = {}
-        if self._encode_signature is None:
+        if model is None or encode_signature is None:
             raise RuntimeError("embedding model signature is unavailable")
-        input_name = "texts" if "texts" in self._encode_signature.parameters else "sentences"
+        input_name = "texts" if "texts" in encode_signature.parameters else "sentences"
         requested_dimensions = dimensions or self._settings.default_dimensions
         effective_task = task or self._settings.embedding_task
-        if effective_task and "task" in self._encode_signature.parameters:
+        if effective_task and "task" in encode_signature.parameters:
             kwargs["task"] = effective_task
-        if prompt_name and "prompt_name" in self._encode_signature.parameters:
+        if prompt_name and "prompt_name" in encode_signature.parameters:
             kwargs["prompt_name"] = prompt_name
-        if requested_dimensions and "truncate_dim" in self._encode_signature.parameters:
+        if requested_dimensions and "truncate_dim" in encode_signature.parameters:
             kwargs["truncate_dim"] = requested_dimensions
-        if self._settings.max_length and "max_length" in self._encode_signature.parameters:
+        if self._settings.max_length and "max_length" in encode_signature.parameters:
             kwargs["max_length"] = self._settings.max_length
 
         import torch
 
-        track_mem = self._preferred_device == "cuda"
+        track_mem = preferred_device == "cuda"
         if track_mem:
             torch.cuda.reset_peak_memory_stats()
             mem_before = torch.cuda.memory_allocated()
 
         start = time.perf_counter()
         with torch.no_grad():
-            outputs = self._model.encode(**{input_name: texts}, **kwargs)
+            outputs = model.encode(**{input_name: texts}, **kwargs)
         elapsed_ms = (time.perf_counter() - start) * 1000
 
         if track_mem:
@@ -1458,7 +1543,7 @@ class EmbedderRuntime:
         array = _outputs_to_numpy(outputs)
         if array.ndim == 1:
             array = np.expand_dims(array, axis=0)
-        if requested_dimensions and "truncate_dim" not in self._encode_signature.parameters:
+        if requested_dimensions and "truncate_dim" not in encode_signature.parameters:
             if requested_dimensions > array.shape[1]:
                 raise ValueError(f"Requested dimensions={requested_dimensions} but model only produced {array.shape[1]}")
             array = array[:, :requested_dimensions]
