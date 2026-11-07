@@ -131,7 +131,7 @@ On CUDA hosts, the provider now keeps the HTTP process alive but moves the loade
 - `DEVICE_SWITCH_MIN_SECONDS`: minimum interval between automatic CPU/CUDA device switches
 - `START_DEVICE`: startup device policy, usually `cpu`, `cuda`, or `auto`
 - `CPU_BATCH_TARGET`: normal CPU queue-drain batch target
-- `CPU_TO_GPU_SCALE_UP_TEXTS`: queued/requested text count threshold that promotes CPU to CUDA
+- `CPU_TO_GPU_SCALE_UP_TEXTS`: queued/requested text count threshold that promotes CPU to CUDA (the GPU worker loads in the background; requests stay on CPU until it is ready)
 - `GPU_TO_CPU_SCALE_DOWN_TEXTS`: sustained small CUDA batch threshold used for scale-down
 - `GPU_TO_CPU_SCALE_DOWN_SECONDS`: how long small CUDA batches must persist before CPU scale-down
 - `CUDA_VISIBLE_DEVICES`: the cards the GPU worker may use. With several cards (for example `0,1`) each GPU worker start probes their free VRAM with `nvidia-smi` and runs on the one with the most free memory (the first listed card on ties or failed probes); the worker process sees only that card, and the VRAM batch cap follows it. With one card nothing is probed. Use this when the LLM gateway moves its models between the cards. `/statsz` shows the card as `cuda_device_index`.
