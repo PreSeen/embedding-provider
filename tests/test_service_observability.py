@@ -792,3 +792,134 @@ def test_request_log_buffer_records_prompt_name() -> None:
     )
     assert log.recent_inputs(limit=1)[0]["prompt_name"] == "query"
     assert log.recent_requests(limit=1)[0]["prompt_name"] == "query"
+
+
+def test_settings_reads_interactive_max_tokens() -> None:
+    with patch.dict(os.environ, {"INTERACTIVE_MAX_TOKENS": "1024"}, clear=True):
+        assert Settings.from_env().interactive_max_tokens == 1024
+    with patch.dict(os.environ, {}, clear=True):
+        assert Settings.from_env().interactive_max_tokens == 0
+
+
+def test_continuous_batcher_caps_forward_by_padded_token_budget() -> None:
+    runtime = FakeRuntime()
+
+    async def run() -> list[_PendingItem]:
+        batcher = ContinuousBatcher(runtime, ProviderRuntimeStats(), window_secs=0.001, max_forward_tokens=10)
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[list[list[float]]] = loop.create_future()
+        state = _PendingRequestState(future=future, embeddings=[None] * 4, remaining=4)
+        now = time.monotonic()
+        items = [
+            _PendingItem(
+                text=f"t{index}",
+                input_index=index,
+                dimensions=1,
+                task=None,
+                state=state,
+                enqueued_at=now,
+                request_id="budget-test",
+                token_count=token_count,
+            )
+            for index, token_count in enumerate([3, 3, 3, 6])
+        ]
+        return await batcher._dispatch(items, loop, observe_demand=True)
+
+    overflow = asyncio.run(run())
+    # 3 texts padded to 3 tokens fit the 10-token budget; adding the 6-token text pads 4 texts to 24.
+    assert runtime.seen_batches == [3]
+    assert [item.token_count for item in overflow] == [6]
+
+
+def test_continuous_batcher_forwards_one_text_over_token_budget_alone() -> None:
+    runtime = FakeRuntime()
+
+    async def run() -> list[_PendingItem]:
+        batcher = ContinuousBatcher(runtime, ProviderRuntimeStats(), window_secs=0.001, max_forward_tokens=10)
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[list[list[float]]] = loop.create_future()
+        state = _PendingRequestState(future=future, embeddings=[None] * 2, remaining=2)
+        now = time.monotonic()
+        items = [
+            _PendingItem(
+                text=f"t{index}",
+                input_index=index,
+                dimensions=1,
+                task=None,
+                state=state,
+                enqueued_at=now,
+                request_id="budget-test",
+                token_count=token_count,
+            )
+            for index, token_count in enumerate([12, 2])
+        ]
+        return await batcher._dispatch(items, loop, observe_demand=True)
+
+    overflow = asyncio.run(run())
+    assert runtime.seen_batches == [1]
+    assert [item.token_count for item in overflow] == [2]
+
+
+class BlockingRuntime(FakeRuntime):
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def encode(self, texts: list[str], **kwargs: Any) -> list[list[float]]:
+        self.started.set()
+        assert self.release.wait(timeout=10)
+        return super().encode(texts, **kwargs)
+
+
+def test_short_request_is_served_while_bulk_forward_is_running() -> None:
+    bulk = BlockingRuntime()
+    interactive = FakeRuntime()
+    settings = replace(_settings(), interactive_max_tokens=4)
+    app = create_app(settings=settings, runtime=bulk, interactive_runtime=interactive)
+    headers = {"Authorization": "Bearer test-key"}
+    with TestClient(app) as client, ThreadPoolExecutor(max_workers=1) as pool:
+        # "Document: " + 9 words = 10 tokens, over the 4-token interactive budget.
+        long_text = " ".join(f"w{index}" for index in range(9))
+        bulk_future = pool.submit(client.post, "/v1/embeddings", headers=headers, json={"input": [long_text]})
+        assert bulk.started.wait(timeout=10)
+
+        short = client.post("/v1/embeddings", headers=headers, json={"input": ["recall query"]})
+
+        assert short.status_code == 200
+        assert interactive.seen_batches == [1]
+        assert not bulk_future.done()
+        bulk.release.set()
+        assert bulk_future.result(timeout=10).status_code == 200
+        assert bulk.seen_batches == [1]
+
+        queue = client.get("/statsz").json()["interactive_queue"]
+        assert queue["max_tokens"] == 4
+        assert queue["stats"]["batches_total"] == 1
+        requests = {item["queue"] for item in client.get("/request-logz").json()["requests"]}
+        assert requests == {"bulk", "interactive"}
+
+
+def test_requests_use_one_queue_when_interactive_budget_is_unset() -> None:
+    bulk = FakeRuntime()
+    app = create_app(settings=_settings(), runtime=bulk)
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/embeddings", headers={"Authorization": "Bearer test-key"}, json={"input": ["recall query"]}
+        )
+        assert response.status_code == 200
+        assert bulk.seen_batches == [1]
+        assert client.get("/statsz").json()["interactive_queue"] is None
+
+
+def test_interactive_encoder_owns_a_separate_cpu_model_instance() -> None:
+    from provider.app import EmbedderRuntime
+
+    settings = replace(_settings(), start_device="cpu", interactive_max_tokens=4)
+    runtime = EmbedderRuntime(settings)
+    encoder = runtime.create_interactive_encoder()
+
+    assert encoder._model is not runtime._model
+    embeddings = encoder.encode(["alpha"], dimensions=4, task="retrieval", prompt_name="query")
+    assert len(embeddings) == 1
+    assert embeddings[0] == pytest.approx([0.5, 0.5, 0.5, 0.5])
