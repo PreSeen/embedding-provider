@@ -164,6 +164,21 @@ Each interactive forward is also capped at `INTERACTIVE_MAX_TOKENS` padded token
 
 On gpu4 the setting is `1024`. It covers 99% of memory.preseen.ai's 1-text requests (p90 514 tokens, p99 940) and 96% of its multi-text ones, while CoSens and email-classifier documents (2,400–8,192 tokens per text) stay in the bulk queue. A 1024-token forward takes about 1 s on CPU alone and 1.6 s beside a bulk forward on 8 cores. Measurements: `docs/benchmarks/2026-11-17-interactive-queue-and-cuda-peak.md`.
 
+## Overflow to a Peer Host
+
+`PEER_BASE_URL` and `OVERFLOW_BUSY_SECONDS` (both unset by default, off) send work to the same model on another host when this one is backed up. It follows llm-gateway's cross-region overflow: the busy host hands requests over, the peer never hands them back.
+
+- A request is forwarded when the queue it would use (interactive or bulk) has had an unfinished text for at least `OVERFLOW_BUSY_SECONDS`. The age counts the forward in progress, so one 100 s CPU forward trips it after the threshold, and a GPU forward of about a second never does. A request whose texts are all cached is served locally; one with any uncached text is forwarded whole.
+- The forward is `POST {PEER_BASE_URL}/embeddings` with `x-gateway-overflow: 1` and, if `PEER_API_KEY` is set, a bearer token. `task` and `dimensions` are sent already resolved from this host's defaults, because the peer's route has its own default task. `prompt_name` is passed through, and `model` is left out so the peer uses the model it has loaded.
+- A request that carries `x-gateway-overflow` is always served locally, so two hosts that list each other cannot bounce a request.
+- If the peer is unreachable, answers non-200, times out (`PEER_TIMEOUT_SECONDS`, default `60`) or returns the wrong number of vectors, the request is served locally and `peer_failures_total` is counted.
+- `OVERFLOW_BUSY_SECONDS` without `PEER_BASE_URL` fails at startup.
+- `/statsz` shows `overflow` (`forwarded_total`, `peer_failures_total`); `/request-logz` records forwarded requests with `queue` = `peer`.
+
+Vectors from the peer must match this host's, so the peer has to run the same model. Measured 2026-11-18, same input on gpu4 and on the A100's `/retrieval/v1`: cosine 0.99994 for `text-matching` and 0.99992 for `retrieval` + `query` (bfloat16 CPU vs GPU). The profile name and `base_url` in memory-connector's vector stamp are unchanged, because the handover happens behind `embed.preseen.ai`.
+
+On gpu4: `PEER_BASE_URL=http://27.221.10.54:41006/retrieval/v1` (the A100 the CN deployment uses, no auth) and `OVERFLOW_BUSY_SECONDS=10`. A CPU forward of 8 long documents takes 59–116 s and memory-connector's timeout is 120 s, so waiting longer than 10 s on a busy CPU already risks a timeout.
+
 ## CUDA Forward Token Budget
 
 `CUDA_MAX_FORWARD_TOKENS` (default `0`, off) caps each GPU forward at that many padded tokens. It must be at least `MAX_LENGTH`, so one text at the limit always fits. The worker's VRAM peak grows about 1.3 GiB per 8192 tokens in a forward, so the cap is what bounds the worker's footprint. llm-gateway's `GPU_NEIGHBOUR_RESERVE_MIB` is sized from that footprint; the two must be changed together. Measured on an RTX 5090 at `MAX_LENGTH=8192` (process footprint as `nvidia-smi` reports it): 1.92 GiB loaded, 3.36 GiB at 8,192 tokens, 4.73 at 16,384, 7.86 at 32,768, 14.1 at 65,536. A cap of 8192 loses almost no throughput: a forward costs about 0.2 s per 8192-token text from batch 2 upward.

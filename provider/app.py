@@ -22,6 +22,7 @@ import threading
 from typing import Any, Literal
 from uuid import uuid4
 
+import httpx
 import numpy as np
 from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -35,6 +36,9 @@ logging.basicConfig(level="INFO")
 _BYTES_PER_MIB = 1024 * 1024
 
 PromptName = Literal["query", "document"]
+
+# Set on a request handed over by a peer; the receiver always serves it, so two hosts never bounce one request.
+OVERFLOW_HEADER = "x-gateway-overflow"
 
 
 def _prompt_prefix(prompt_name: str | None) -> str:
@@ -1900,6 +1904,15 @@ class ContinuousBatcher:
         self._queue: asyncio.Queue[_PendingItem] = asyncio.Queue()
         self._pending_enqueued_at: deque[float] = deque()
 
+    def busy_seconds(self) -> float:
+        """How long the oldest unfinished text has been in this queue.
+
+        Texts stay counted until their forward ends, so a long forward in progress shows up here too.
+        """
+        if not self._pending_enqueued_at:
+            return 0.0
+        return time.monotonic() - self._pending_enqueued_at[0]
+
     def _refresh_pending_snapshot(self) -> None:
         oldest_age = None
         if self._pending_enqueued_at:
@@ -2488,6 +2501,7 @@ def create_app(
     settings: Settings | None = None,
     runtime: EmbedderRuntime | None = None,
     interactive_runtime: Any | None = None,
+    peer_transport: httpx.AsyncBaseTransport | None = None,
 ) -> FastAPI:
     resolved_settings = settings or Settings.from_env()
     resolved_runtime = runtime or EmbedderRuntime(resolved_settings)
@@ -2506,6 +2520,47 @@ def create_app(
     interactive_stats = ProviderRuntimeStats()
     interactive_batcher: ContinuousBatcher | None = None
     input_length_validator = InputLengthValidator(resolved_settings)
+    # Overflow: a queue that has been busy for OVERFLOW_BUSY_SECONDS sends new requests to PEER_BASE_URL
+    # (the same model on another host). The peer gets OVERFLOW_HEADER, which it never forwards again.
+    overflow_counts = {"forwarded_total": 0, "peer_failures_total": 0}
+    peer_client: httpx.AsyncClient | None = None
+
+    def overflow_status() -> dict[str, Any] | None:
+        if not resolved_settings.peer_base_url:
+            return None
+        return {
+            "peer_base_url": resolved_settings.peer_base_url,
+            "busy_seconds": resolved_settings.overflow_busy_seconds,
+            **overflow_counts,
+        }
+
+    async def forward_to_peer(
+        texts: list[str],
+        *,
+        dimensions: int | None,
+        task: str | None,
+        prompt_name: str | None,
+        request_id: str,
+    ) -> EmbeddingResponse | None:
+        # The peer's route has its own default task, so task and dimensions are always sent resolved.
+        payload: dict[str, Any] = {"input": texts, "dimensions": dimensions, "task": task, "encoding_format": "float"}
+        if prompt_name is not None:
+            payload["prompt_name"] = prompt_name
+        assert peer_client is not None
+        try:
+            response = await peer_client.post(
+                "embeddings", json=payload, headers={OVERFLOW_HEADER: "1", "X-Request-Id": request_id}
+            )
+            response.raise_for_status()
+            peer_response = EmbeddingResponse(**response.json())
+            if len(peer_response.data) != len(texts):
+                raise ValueError(f"peer returned {len(peer_response.data)} embeddings for {len(texts)} texts")
+        except (httpx.HTTPError, ValueError) as exc:
+            overflow_counts["peer_failures_total"] += 1
+            log.warning("overflow to peer failed request_id=%s error=%s", request_id, _summarize_exception(exc))
+            return None
+        overflow_counts["forwarded_total"] += 1
+        return peer_response
 
     def interactive_queue_status() -> dict[str, Any] | None:
         if interactive_batcher is None:
@@ -2514,7 +2569,15 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        nonlocal interactive_batcher
+        nonlocal interactive_batcher, peer_client
+        if resolved_settings.peer_base_url and resolved_settings.overflow_busy_seconds > 0:
+            peer_headers = {"Authorization": f"Bearer {resolved_settings.peer_api_key}"} if resolved_settings.peer_api_key else {}
+            peer_client = httpx.AsyncClient(
+                base_url=f"{resolved_settings.peer_base_url}/",
+                headers=peer_headers,
+                timeout=resolved_settings.peer_timeout_seconds,
+                transport=peer_transport,
+            )
         if resolved_settings.interactive_max_tokens > 0:
             interactive_batcher = ContinuousBatcher(
                 interactive_runtime or resolved_runtime.create_interactive_encoder(),
@@ -2551,6 +2614,8 @@ def create_app(
                 await offload_task
             except asyncio.CancelledError:
                 pass
+        if peer_client is not None:
+            await peer_client.aclose()
         resolved_runtime.close()
 
     app = FastAPI(title="Embedding Provider", version="0.3.0", lifespan=lifespan)
@@ -2593,6 +2658,7 @@ def create_app(
             "stats": stats.snapshot(),
             "runtime": resolved_runtime.runtime_status(),
             "interactive_queue": interactive_queue_status(),
+            "overflow": overflow_status(),
             "cache": embedding_cache.snapshot(),
         }
 
@@ -2663,6 +2729,7 @@ def create_app(
         response: Response,
         authorization: str | None = Header(default=None),
         x_request_id: str | None = Header(default=None, alias="X-Request-Id"),
+        x_gateway_overflow: str | None = Header(default=None, alias=OVERFLOW_HEADER),
     ) -> EmbeddingResponse:
         _require_api_key(resolved_settings, authorization)
         request_id = (x_request_id or uuid4().hex).strip()
@@ -2741,22 +2808,42 @@ def create_app(
                 ):
                     queue_batcher = interactive_batcher
                     queue = "interactive"
-                miss_embeddings = await queue_batcher.encode(
-                    miss_texts,
-                    dimensions=request.dimensions,
-                    task=request.task,
-                    prompt_name=request.prompt_name,
-                    request_id=request_id,
-                    token_counts=miss_token_counts,
-                )
-                embedding_cache.set_many(
-                    [
-                        (cache_keys[idx], embedding)
-                        for idx, embedding in zip(miss_indices, miss_embeddings)
-                    ]
-                )
-                for idx, embedding in zip(miss_indices, miss_embeddings):
-                    cached_embeddings[idx] = embedding
+                peer_response: EmbeddingResponse | None = None
+                if (
+                    peer_client is not None
+                    and x_gateway_overflow is None
+                    and queue_batcher.busy_seconds() >= resolved_settings.overflow_busy_seconds
+                ):
+                    # The peer applies its own truncation, so it gets the inputs as received.
+                    peer_response = await forward_to_peer(
+                        texts,
+                        dimensions=effective_dimensions,
+                        task=effective_task,
+                        prompt_name=request.prompt_name,
+                        request_id=request_id,
+                    )
+                if peer_response is not None:
+                    queue = "peer"
+                    cached_embeddings = [item.embedding for item in sorted(peer_response.data, key=lambda item: item.index)]
+                    usage_token_count = peer_response.usage.total_tokens
+                    input_warnings = peer_response.warnings
+                else:
+                    miss_embeddings = await queue_batcher.encode(
+                        miss_texts,
+                        dimensions=request.dimensions,
+                        task=request.task,
+                        prompt_name=request.prompt_name,
+                        request_id=request_id,
+                        token_counts=miss_token_counts,
+                    )
+                    embedding_cache.set_many(
+                        [
+                            (cache_keys[idx], embedding)
+                            for idx, embedding in zip(miss_indices, miss_embeddings)
+                        ]
+                    )
+                    for idx, embedding in zip(miss_indices, miss_embeddings):
+                        cached_embeddings[idx] = embedding
             embeddings = [embedding or [] for embedding in cached_embeddings]
         except ValueError as exc:
             duration_ms = (time.perf_counter() - started_at) * 1000

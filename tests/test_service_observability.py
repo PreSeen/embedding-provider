@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from typing import Any
 from unittest.mock import patch
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -950,3 +951,152 @@ def test_interactive_encoder_owns_a_separate_cpu_model_instance() -> None:
     embeddings = encoder.encode(["alpha"], dimensions=4, task="retrieval", prompt_name="query")
     assert len(embeddings) == 1
     assert embeddings[0] == pytest.approx([0.5, 0.5, 0.5, 0.5])
+
+
+def _overflow_settings() -> Settings:
+    return replace(
+        _settings(),
+        peer_base_url="http://peer.test/retrieval/v1",
+        peer_api_key="peer-key",
+        overflow_busy_seconds=0.05,
+    )
+
+
+def _peer_transport(seen: list[httpx.Request], *, status: int = 200) -> httpx.MockTransport:
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if status != 200:
+            return httpx.Response(status, json={"detail": "peer failed"})
+        body = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "object": "list",
+                "data": [
+                    {"object": "embedding", "index": index, "embedding": [9.0] * body["dimensions"]}
+                    for index in range(len(body["input"]))
+                ],
+                "model": "peer-model",
+                "usage": {"prompt_tokens": 7, "total_tokens": 7},
+                "warnings": [],
+            },
+        )
+
+    return httpx.MockTransport(handler)
+
+
+def _hold_queue_busy(client: TestClient, pool: ThreadPoolExecutor, runtime: BlockingRuntime) -> Any:
+    """Start a forward that blocks, then wait until the queue has been busy past the overflow threshold."""
+    held = pool.submit(
+        client.post, "/v1/embeddings", headers={"Authorization": "Bearer test-key"}, json={"input": ["held"]}
+    )
+    assert runtime.started.wait(timeout=10)
+    time.sleep(0.15)
+    return held
+
+
+def test_busy_queue_sends_request_to_peer_with_resolved_task_and_overflow_header() -> None:
+    local = BlockingRuntime()
+    seen: list[httpx.Request] = []
+    app = create_app(settings=_overflow_settings(), runtime=local, peer_transport=_peer_transport(seen))
+    with TestClient(app) as client, ThreadPoolExecutor(max_workers=1) as pool:
+        held = _hold_queue_busy(client, pool, local)
+
+        response = client.post(
+            "/v1/embeddings",
+            headers={"Authorization": "Bearer test-key"},
+            json={"input": ["recall query"], "prompt_name": "query"},
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["data"][0]["embedding"] == [9.0] * 4
+        assert body["usage"]["total_tokens"] == 7
+        assert len(seen) == 1
+        assert str(seen[0].url) == "http://peer.test/retrieval/v1/embeddings"
+        assert seen[0].headers["x-gateway-overflow"] == "1"
+        assert seen[0].headers["authorization"] == "Bearer peer-key"
+        sent = json.loads(seen[0].content)
+        # The peer's route has its own default task, so the task and dimensions are pinned from this host.
+        assert sent["task"] == "text-matching"
+        assert sent["dimensions"] == 4
+        assert sent["prompt_name"] == "query"
+        assert sent["input"] == ["recall query"]
+        assert local.seen_batches == []
+        assert not held.done()
+
+        stats = client.get("/statsz").json()
+        assert stats["overflow"]["forwarded_total"] == 1
+        logged = {item["request_id"]: item["queue"] for item in client.get("/request-logz").json()["requests"]}
+        assert "peer" in logged.values()
+        local.release.set()
+        assert held.result(timeout=10).status_code == 200
+
+
+def test_idle_queue_serves_locally_even_with_a_peer_configured() -> None:
+    local = FakeRuntime()
+    seen: list[httpx.Request] = []
+    app = create_app(settings=_overflow_settings(), runtime=local, peer_transport=_peer_transport(seen))
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/embeddings", headers={"Authorization": "Bearer test-key"}, json={"input": ["recall query"]}
+        )
+        assert response.status_code == 200
+        assert local.seen_batches == [1]
+        assert seen == []
+        assert client.get("/statsz").json()["overflow"]["forwarded_total"] == 0
+
+
+def test_request_that_already_crossed_is_served_locally_even_when_busy() -> None:
+    local = BlockingRuntime()
+    seen: list[httpx.Request] = []
+    app = create_app(settings=_overflow_settings(), runtime=local, peer_transport=_peer_transport(seen))
+    with TestClient(app) as client, ThreadPoolExecutor(max_workers=1) as pool:
+        held = _hold_queue_busy(client, pool, local)
+        threading.Timer(0.3, local.release.set).start()
+
+        response = client.post(
+            "/v1/embeddings",
+            headers={"Authorization": "Bearer test-key", "x-gateway-overflow": "1"},
+            json={"input": ["from the peer"]},
+        )
+
+        assert response.status_code == 200
+        assert seen == []
+        assert held.result(timeout=10).status_code == 200
+
+
+def test_peer_failure_serves_the_request_locally() -> None:
+    local = BlockingRuntime()
+    seen: list[httpx.Request] = []
+    app = create_app(settings=_overflow_settings(), runtime=local, peer_transport=_peer_transport(seen, status=500))
+    with TestClient(app) as client, ThreadPoolExecutor(max_workers=1) as pool:
+        held = _hold_queue_busy(client, pool, local)
+        threading.Timer(0.3, local.release.set).start()
+
+        response = client.post(
+            "/v1/embeddings", headers={"Authorization": "Bearer test-key"}, json={"input": ["recall query"]}
+        )
+
+        assert response.status_code == 200
+        assert response.json()["data"][0]["embedding"] == [1.0] * 4
+        assert len(seen) == 1
+        overflow = client.get("/statsz").json()["overflow"]
+        assert overflow["forwarded_total"] == 0
+        assert overflow["peer_failures_total"] == 1
+        assert held.result(timeout=10).status_code == 200
+
+
+def test_settings_reads_overflow_and_requires_a_peer_when_enabled() -> None:
+    env = {"PEER_BASE_URL": "http://peer.test/v1", "PEER_API_KEY": "k", "OVERFLOW_BUSY_SECONDS": "10", "PEER_TIMEOUT_SECONDS": "30"}
+    with patch.dict(os.environ, env, clear=True):
+        settings = Settings.from_env()
+    assert (settings.peer_base_url, settings.peer_api_key) == ("http://peer.test/v1", "k")
+    assert (settings.overflow_busy_seconds, settings.peer_timeout_seconds) == (10.0, 30.0)
+    with patch.dict(os.environ, {}, clear=True):
+        settings = Settings.from_env()
+    assert settings.peer_base_url is None
+    assert settings.overflow_busy_seconds == 0.0
+    with patch.dict(os.environ, {"OVERFLOW_BUSY_SECONDS": "10"}, clear=True):
+        with pytest.raises(ValueError, match="PEER_BASE_URL"):
+            Settings.from_env()
