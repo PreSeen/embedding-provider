@@ -900,6 +900,33 @@ def test_short_request_is_served_while_bulk_forward_is_running() -> None:
         assert requests == {"bulk", "interactive"}
 
 
+def test_interactive_encoder_is_loaded_at_startup_not_at_app_creation() -> None:
+    # provider/__init__.py imports provider.app, whose module-level create_app() runs in every process
+    # that imports the package, the GPU worker included. Loading the interactive CPU model there hides
+    # CUDA while the model loads, so the worker's CUDA init then reported "No CUDA GPUs are available".
+    class CountingRuntime(FakeRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.interactive_encoders_created = 0
+
+        def create_interactive_encoder(self) -> FakeRuntime:
+            self.interactive_encoders_created += 1
+            return FakeRuntime()
+
+    runtime = CountingRuntime()
+    settings = replace(_settings(), interactive_max_tokens=4)
+    app = create_app(settings=settings, runtime=runtime)
+
+    assert runtime.interactive_encoders_created == 0
+    with TestClient(app) as client:
+        assert runtime.interactive_encoders_created == 1
+        response = client.post(
+            "/v1/embeddings", headers={"Authorization": "Bearer test-key"}, json={"input": ["recall query"]}
+        )
+        assert response.status_code == 200
+        assert client.get("/statsz").json()["interactive_queue"]["stats"]["batches_total"] == 1
+
+
 def test_requests_use_one_queue_when_interactive_budget_is_unset() -> None:
     bulk = FakeRuntime()
     app = create_app(settings=_settings(), runtime=bulk)

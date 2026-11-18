@@ -2500,17 +2500,11 @@ def create_app(
     resolved_runtime.attach_stats(stats)
     batcher = ContinuousBatcher(resolved_runtime, stats=stats, window_secs=resolved_settings.batch_window_ms / 1000)
     # Requests whose uncached inputs total at most INTERACTIVE_MAX_TOKENS go to a second queue with
-    # its own CPU encoder, so they never wait behind a bulk forward.
+    # its own CPU encoder, so they never wait behind a bulk forward. The queue is built at startup, not
+    # here: this module's `app = create_app()` also runs in the GPU worker (it imports the provider
+    # package), and loading the CPU model hides CUDA, which left the worker with no CUDA devices.
     interactive_stats = ProviderRuntimeStats()
     interactive_batcher: ContinuousBatcher | None = None
-    if resolved_settings.interactive_max_tokens > 0:
-        interactive_batcher = ContinuousBatcher(
-            interactive_runtime or resolved_runtime.create_interactive_encoder(),
-            stats=interactive_stats,
-            window_secs=resolved_settings.batch_window_ms / 1000,
-            max_forward_tokens=resolved_settings.interactive_max_tokens,
-            name="interactive",
-        )
     input_length_validator = InputLengthValidator(resolved_settings)
 
     def interactive_queue_status() -> dict[str, Any] | None:
@@ -2520,6 +2514,15 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        nonlocal interactive_batcher
+        if resolved_settings.interactive_max_tokens > 0:
+            interactive_batcher = ContinuousBatcher(
+                interactive_runtime or resolved_runtime.create_interactive_encoder(),
+                stats=interactive_stats,
+                window_secs=resolved_settings.batch_window_ms / 1000,
+                max_forward_tokens=resolved_settings.interactive_max_tokens,
+                name="interactive",
+            )
         task = batcher.start()
         interactive_task = interactive_batcher.start() if interactive_batcher is not None else None
         offload_task: asyncio.Task | None = None
