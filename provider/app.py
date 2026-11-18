@@ -297,6 +297,7 @@ class RequestLogBuffer:
             "task": task,
             "prompt_name": prompt_name,
             "text_count": len(texts),
+            "queue": None,
             "status": "running",
             "status_code": None,
             "duration_ms": None,
@@ -335,11 +336,13 @@ class RequestLogBuffer:
         status_code: int,
         duration_ms: float,
         error_summary: str | None = None,
+        queue: str | None = None,
     ) -> None:
         with self._lock:
             entry = self._request_index.get(request_id)
             if entry is None:
                 return
+            entry["queue"] = queue
             entry["status"] = "ok" if status_code < 400 else "error"
             entry["status_code"] = status_code
             entry["duration_ms"] = round(duration_ms, 3)
@@ -949,6 +952,109 @@ class _GpuEmbedderWorker:
                 future.set_exception(exc)
 
 
+def _padded_token_prefix_length(token_counts: list[int], budget: int) -> int:
+    """How many leading texts fit one forward of ``budget`` padded tokens (texts x longest text), at least one."""
+    longest = 0
+    for count, token_count in enumerate(token_counts, start=1):
+        longest = max(longest, token_count)
+        if count * longest > budget:
+            return max(1, count - 1)
+    return len(token_counts)
+
+
+def _model_encode_arguments(
+    settings: Settings,
+    encode_signature: inspect.Signature,
+    *,
+    dimensions: int | None,
+    task: str | None,
+    prompt_name: str | None,
+) -> tuple[str, dict[str, Any]]:
+    """Name of the texts argument and the keyword arguments for an in-process ``model.encode`` call."""
+    kwargs: dict[str, Any] = {}
+    input_name = "texts" if "texts" in encode_signature.parameters else "sentences"
+    requested_dimensions = dimensions or settings.default_dimensions
+    effective_task = task or settings.embedding_task
+    if effective_task and "task" in encode_signature.parameters:
+        kwargs["task"] = effective_task
+    if prompt_name and "prompt_name" in encode_signature.parameters:
+        kwargs["prompt_name"] = prompt_name
+    if requested_dimensions and "truncate_dim" in encode_signature.parameters:
+        kwargs["truncate_dim"] = requested_dimensions
+    if settings.max_length and "max_length" in encode_signature.parameters:
+        kwargs["max_length"] = settings.max_length
+    return input_name, kwargs
+
+
+def _embeddings_from_outputs(
+    settings: Settings,
+    encode_signature: inspect.Signature,
+    outputs: Any,
+    *,
+    dimensions: int | None,
+) -> list[list[float]]:
+    requested_dimensions = dimensions or settings.default_dimensions
+    array = _outputs_to_numpy(outputs)
+    if array.ndim == 1:
+        array = np.expand_dims(array, axis=0)
+    if requested_dimensions and "truncate_dim" not in encode_signature.parameters:
+        if requested_dimensions > array.shape[1]:
+            raise ValueError(f"Requested dimensions={requested_dimensions} but model only produced {array.shape[1]}")
+        array = array[:, :requested_dimensions]
+    if settings.normalize_embeddings:
+        norms = np.linalg.norm(array, axis=1, keepdims=True)
+        norms = np.where(norms == 0.0, 1.0, norms)
+        array = array / norms
+    return array.tolist()
+
+
+class InteractiveCpuEncoder:
+    """Serves the interactive queue (requests of at most INTERACTIVE_MAX_TOKENS) from a CPU model of its own.
+
+    The bulk queue runs one forward at a time, and a CPU forward of long documents takes tens of
+    seconds, so short recall queries and memory writes used to wait behind it for minutes. This encoder
+    runs its forwards beside the bulk queue's. It needs its own model object because Jina v5 ``encode()``
+    calls ``set_adapter([task])`` on the model it runs: two concurrent forwards on one instance with
+    different tasks would race on the active adapter.
+    """
+
+    _preferred_device = "cpu"
+
+    def __init__(self, settings: Settings, model: Any) -> None:
+        self._settings = settings
+        self._model = model
+        self._encode_signature = inspect.signature(model.encode)
+
+    def encode(
+        self,
+        texts: list[str],
+        *,
+        dimensions: int | None = None,
+        task: str | None = None,
+        prompt_name: str | None = None,
+        allow_batch_growth: bool = False,
+    ) -> list[list[float]]:
+        input_name, kwargs = _model_encode_arguments(
+            self._settings, self._encode_signature, dimensions=dimensions, task=task, prompt_name=prompt_name
+        )
+        import torch
+
+        start = time.perf_counter()
+        with torch.no_grad():
+            outputs = self._model.encode(**{input_name: texts}, **kwargs)
+        log.info(
+            "interactive queue model=%s texts=%s elapsed_ms=%.1f",
+            self._settings.model_id,
+            len(texts),
+            (time.perf_counter() - start) * 1000,
+        )
+        return _embeddings_from_outputs(self._settings, self._encode_signature, outputs, dimensions=dimensions)
+
+    def estimate_max_texts(self) -> int:
+        # The batcher's padded-token budget is what bounds these forwards.
+        return self._settings.max_batch_size or 64
+
+
 class EmbedderRuntime:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
@@ -994,6 +1100,9 @@ class EmbedderRuntime:
 
     def attach_stats(self, stats: ProviderRuntimeStats) -> None:
         self._stats = stats
+
+    def create_interactive_encoder(self) -> InteractiveCpuEncoder:
+        return InteractiveCpuEncoder(self._settings, self._load_model("cpu"))
 
     def _resolve_dtype(self) -> Any:
         import torch
@@ -1498,20 +1607,11 @@ class EmbedderRuntime:
                 else:
                     self._bytes_per_text_ema = self._ema_alpha * sample + (1 - self._ema_alpha) * self._bytes_per_text_ema
             return embeddings
-        kwargs: dict[str, Any] = {}
         if model is None or encode_signature is None:
             raise RuntimeError("embedding model signature is unavailable")
-        input_name = "texts" if "texts" in encode_signature.parameters else "sentences"
-        requested_dimensions = dimensions or self._settings.default_dimensions
-        effective_task = task or self._settings.embedding_task
-        if effective_task and "task" in encode_signature.parameters:
-            kwargs["task"] = effective_task
-        if prompt_name and "prompt_name" in encode_signature.parameters:
-            kwargs["prompt_name"] = prompt_name
-        if requested_dimensions and "truncate_dim" in encode_signature.parameters:
-            kwargs["truncate_dim"] = requested_dimensions
-        if self._settings.max_length and "max_length" in encode_signature.parameters:
-            kwargs["max_length"] = self._settings.max_length
+        input_name, kwargs = _model_encode_arguments(
+            self._settings, encode_signature, dimensions=dimensions, task=task, prompt_name=prompt_name
+        )
 
         import torch
 
@@ -1540,18 +1640,7 @@ class EmbedderRuntime:
             self._bytes_per_text_ema or 0,
         )
 
-        array = _outputs_to_numpy(outputs)
-        if array.ndim == 1:
-            array = np.expand_dims(array, axis=0)
-        if requested_dimensions and "truncate_dim" not in encode_signature.parameters:
-            if requested_dimensions > array.shape[1]:
-                raise ValueError(f"Requested dimensions={requested_dimensions} but model only produced {array.shape[1]}")
-            array = array[:, :requested_dimensions]
-        if self._settings.normalize_embeddings:
-            norms = np.linalg.norm(array, axis=1, keepdims=True)
-            norms = np.where(norms == 0.0, 1.0, norms)
-            array = array / norms
-        return array.tolist()
+        return _embeddings_from_outputs(self._settings, encode_signature, outputs, dimensions=dimensions)
 
     def _encode_with_backoff(
         self,
@@ -1662,6 +1751,13 @@ class EmbedderRuntime:
         succeeded = False
         try:
             embeddings: list[list[float]] = []
+            # Bounds the worker's VRAM peak, which is what GPU_NEIGHBOUR_RESERVE_MIB in llm-gateway
+            # is sized from (activations grow about 1.3 GiB per 8192 tokens).
+            token_counts = (
+                self._input_length_validator.token_counts(texts, prompt_name)
+                if self._preferred_device == "cuda" and self._settings.cuda_max_forward_tokens
+                else None
+            )
             offset = 0
             while offset < len(texts):
                 remaining = len(texts) - offset
@@ -1673,6 +1769,10 @@ class EmbedderRuntime:
                         vram_cap = self._estimate_vram_text_cap()
                     chunk_target = min(max_batch_size, self.adaptive_batch.effective_target(vram_cap=vram_cap))
                 chunk_size = max(1, min(chunk_target, remaining))
+                if token_counts is not None:
+                    chunk_size = _padded_token_prefix_length(
+                        token_counts[offset: offset + chunk_size], self._settings.cuda_max_forward_tokens
+                    )
                 chunk = texts[offset: offset + chunk_size]
                 result = self._encode_with_backoff(chunk, dimensions=dimensions, task=task, prompt_name=prompt_name)
                 embeddings.extend(result.embeddings)
@@ -1777,15 +1877,26 @@ class _PendingItem:
     enqueued_at: float
     request_id: str
     prompt_name: str | None = None
+    token_count: int = 0
 
 
 class ContinuousBatcher:
     """Collect requests into bounded batches and optionally split GPU forwards into lanes."""
 
-    def __init__(self, runtime: EmbedderRuntime, stats: ProviderRuntimeStats, window_secs: float) -> None:
+    def __init__(
+        self,
+        runtime: Any,
+        stats: ProviderRuntimeStats,
+        window_secs: float,
+        *,
+        max_forward_tokens: int | None = None,
+        name: str = "bulk",
+    ) -> None:
         self._runtime = runtime
         self._stats = stats
         self._window = window_secs
+        self._max_forward_tokens = max_forward_tokens
+        self._name = name
         self._queue: asyncio.Queue[_PendingItem] = asyncio.Queue()
         self._pending_enqueued_at: deque[float] = deque()
 
@@ -1817,6 +1928,7 @@ class ContinuousBatcher:
         task: str | None = None,
         prompt_name: str | None = None,
         request_id: str,
+        token_counts: list[int] | None = None,
     ) -> list[list[float]]:
         loop = asyncio.get_running_loop()
         future: asyncio.Future[list[list[float]]] = loop.create_future()
@@ -1837,6 +1949,7 @@ class ContinuousBatcher:
                     state=state,
                     enqueued_at=enqueued_at,
                     request_id=request_id,
+                    token_count=token_counts[input_index] if token_counts else 0,
                 )
             )
             self._mark_enqueued(enqueued_at)
@@ -1904,8 +2017,13 @@ class ContinuousBatcher:
             max_texts = max(1, self._runtime.estimate_max_texts())
             if observe_demand and getattr(self._runtime, "_preferred_device", None) == "cuda":
                 self._runtime.adaptive_batch.record_observed_demand(text_count=len(items))
-            to_process = items[:max_texts]
-            overflow.extend(items[max_texts:])
+            take = min(len(items), max_texts)
+            if self._max_forward_tokens:
+                take = _padded_token_prefix_length(
+                    [item.token_count for item in items[:take]], self._max_forward_tokens
+                )
+            to_process = items[:take]
+            overflow.extend(items[take:])
             group_overflow = len(items) - len(to_process)
             all_texts = [item.text for item in to_process]
             text_count = len(all_texts)
@@ -1916,8 +2034,9 @@ class ContinuousBatcher:
             lanes = [to_process[index:index + lane_size] for index in range(0, text_count, lane_size)]
 
             log.info(
-                "batch dispatch: requests=%d texts=%d overflow=%d lanes=%d task=%s prompt=%s dim=%s",
-                len({item.request_id for item in to_process}), text_count, group_overflow, len(lanes), task, prompt_name, dimensions,
+                "batch dispatch: queue=%s requests=%d texts=%d overflow=%d lanes=%d task=%s prompt=%s dim=%s",
+                self._name, len({item.request_id for item in to_process}), text_count, group_overflow, len(lanes),
+                task, prompt_name, dimensions,
             )
             self._stats.record_batch_dispatch(request_count=len({item.request_id for item in to_process}), text_count=text_count)
             self._stats.set_running_batch(text_count=text_count)
@@ -2365,7 +2484,11 @@ setInterval(refresh, 3000);
 </html>"""
 
 
-def create_app(settings: Settings | None = None, runtime: EmbedderRuntime | None = None) -> FastAPI:
+def create_app(
+    settings: Settings | None = None,
+    runtime: EmbedderRuntime | None = None,
+    interactive_runtime: Any | None = None,
+) -> FastAPI:
     resolved_settings = settings or Settings.from_env()
     resolved_runtime = runtime or EmbedderRuntime(resolved_settings)
     stats = ProviderRuntimeStats()
@@ -2376,11 +2499,29 @@ def create_app(settings: Settings | None = None, runtime: EmbedderRuntime | None
     embedding_cache = EmbeddingResultCache(max_entries=resolved_settings.embedding_cache_limit)
     resolved_runtime.attach_stats(stats)
     batcher = ContinuousBatcher(resolved_runtime, stats=stats, window_secs=resolved_settings.batch_window_ms / 1000)
+    # Requests whose uncached inputs total at most INTERACTIVE_MAX_TOKENS go to a second queue with
+    # its own CPU encoder, so they never wait behind a bulk forward.
+    interactive_stats = ProviderRuntimeStats()
+    interactive_batcher: ContinuousBatcher | None = None
+    if resolved_settings.interactive_max_tokens > 0:
+        interactive_batcher = ContinuousBatcher(
+            interactive_runtime or resolved_runtime.create_interactive_encoder(),
+            stats=interactive_stats,
+            window_secs=resolved_settings.batch_window_ms / 1000,
+            max_forward_tokens=resolved_settings.interactive_max_tokens,
+            name="interactive",
+        )
     input_length_validator = InputLengthValidator(resolved_settings)
+
+    def interactive_queue_status() -> dict[str, Any] | None:
+        if interactive_batcher is None:
+            return None
+        return {"max_tokens": resolved_settings.interactive_max_tokens, "stats": interactive_stats.snapshot()}
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         task = batcher.start()
+        interactive_task = interactive_batcher.start() if interactive_batcher is not None else None
         offload_task: asyncio.Task | None = None
         if resolved_runtime.runtime_status()["idle_offload_enabled"]:
             async def idle_offload_worker() -> None:
@@ -2391,12 +2532,17 @@ def create_app(settings: Settings | None = None, runtime: EmbedderRuntime | None
             offload_task = asyncio.create_task(idle_offload_worker())
         yield
         task.cancel()
+        if interactive_task is not None:
+            interactive_task.cancel()
         if offload_task is not None:
             offload_task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
+        for batcher_task in (task, interactive_task):
+            if batcher_task is None:
+                continue
+            try:
+                await batcher_task
+            except asyncio.CancelledError:
+                pass
         if offload_task is not None:
             try:
                 await offload_task
@@ -2419,6 +2565,7 @@ def create_app(settings: Settings | None = None, runtime: EmbedderRuntime | None
             "batch_window_ms": resolved_settings.batch_window_ms,
             "runtime": resolved_runtime.runtime_status(),
             "stats": stats.snapshot(),
+            "interactive_queue": interactive_queue_status(),
             "cache": embedding_cache.snapshot(),
         }
 
@@ -2442,6 +2589,7 @@ def create_app(settings: Settings | None = None, runtime: EmbedderRuntime | None
             "model": resolved_settings.model_id,
             "stats": stats.snapshot(),
             "runtime": resolved_runtime.runtime_status(),
+            "interactive_queue": interactive_queue_status(),
             "cache": embedding_cache.snapshot(),
         }
 
@@ -2482,6 +2630,7 @@ def create_app(settings: Settings | None = None, runtime: EmbedderRuntime | None
             ),
             "stats": stats.snapshot(),
             "runtime": resolved_runtime.runtime_status(),
+            "interactive_queue": interactive_queue_status(),
             "cache": embedding_cache.snapshot(),
         }
 
@@ -2547,11 +2696,12 @@ def create_app(settings: Settings | None = None, runtime: EmbedderRuntime | None
         texts_for_embedding, input_warnings, _token_counts = input_length_validator.truncate_over_limit(
             texts, request.prompt_name
         )
-        usage_token_count = (
-            sum(input_length_validator.token_counts(texts_for_embedding, request.prompt_name))
+        token_counts = (
+            input_length_validator.token_counts(texts_for_embedding, request.prompt_name)
             if input_length_validator.max_length
-            else _estimate_tokens(texts_for_embedding)
+            else [_estimate_tokens([text]) for text in texts_for_embedding]
         )
+        usage_token_count = sum(token_counts)
         if input_warnings:
             log.warning(
                 "embedding request inputs truncated request_id=%s texts=%d warnings=%s",
@@ -2575,15 +2725,26 @@ def create_app(settings: Settings | None = None, runtime: EmbedderRuntime | None
         ]
         cached_embeddings = embedding_cache.get_many(cache_keys)
         miss_indices = [idx for idx, embedding in enumerate(cached_embeddings) if embedding is None]
+        queue = "cache"
         try:
             if miss_indices:
                 miss_texts = [texts_for_embedding[idx] for idx in miss_indices]
-                miss_embeddings = await batcher.encode(
+                miss_token_counts = [token_counts[idx] for idx in miss_indices]
+                queue_batcher = batcher
+                queue = "bulk"
+                if (
+                    interactive_batcher is not None
+                    and sum(miss_token_counts) <= resolved_settings.interactive_max_tokens
+                ):
+                    queue_batcher = interactive_batcher
+                    queue = "interactive"
+                miss_embeddings = await queue_batcher.encode(
                     miss_texts,
                     dimensions=request.dimensions,
                     task=request.task,
                     prompt_name=request.prompt_name,
                     request_id=request_id,
+                    token_counts=miss_token_counts,
                 )
                 embedding_cache.set_many(
                     [
@@ -2649,11 +2810,13 @@ def create_app(settings: Settings | None = None, runtime: EmbedderRuntime | None
             request_id=request_id,
             status_code=200,
             duration_ms=duration_ms,
+            queue=queue,
         )
         log.info(
-            "embedding request succeeded request_id=%s texts=%d duration_ms=%.1f",
+            "embedding request succeeded request_id=%s texts=%d queue=%s duration_ms=%.1f",
             request_id,
             len(texts),
+            queue,
             duration_ms,
         )
 

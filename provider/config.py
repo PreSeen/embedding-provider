@@ -61,6 +61,15 @@ class Settings:
     cuda_vram_safety_total_ratio: float = 0.05
     gpu_forward_concurrency: int = 1
     cuda_retry_seconds: float = 300.0
+    interactive_max_tokens: int = 0
+    cuda_max_forward_tokens: int = 0
+
+    def __post_init__(self) -> None:
+        if self.cuda_max_forward_tokens and self.max_length and self.cuda_max_forward_tokens < self.max_length:
+            raise ValueError(
+                f"CUDA_MAX_FORWARD_TOKENS={self.cuda_max_forward_tokens} must cover one text at "
+                f"MAX_LENGTH={self.max_length}"
+            )
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -95,4 +104,6 @@ class Settings:
             cuda_vram_safety_total_ratio=_env_float("CUDA_VRAM_SAFETY_TOTAL_RATIO", "0.05"),
             gpu_forward_concurrency=_positive_env_int("GPU_FORWARD_CONCURRENCY", "1"),
             cuda_retry_seconds=_env_float("CUDA_RETRY_SECONDS", "300"),
+            interactive_max_tokens=_env_int("INTERACTIVE_MAX_TOKENS", "0") or 0,
+            cuda_max_forward_tokens=_env_int("CUDA_MAX_FORWARD_TOKENS", "0") or 0,
         )

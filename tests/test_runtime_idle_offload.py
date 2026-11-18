@@ -274,6 +274,35 @@ class EmbedderRuntimeIdleOffloadTests(unittest.TestCase):
         self.assertGreaterEqual(workers[0].stops, 1)
         self.assertGreaterEqual(workers[1].starts, 1)
 
+    def test_cuda_forwards_stay_within_the_padded_token_budget(self) -> None:
+        workers: list[FakeWorker] = []
+
+        def fake_worker_factory(settings: Settings) -> FakeWorker:
+            worker = FakeWorker(settings)
+            workers.append(worker)
+            return worker
+
+        with (
+            patch.dict(os.environ, {"CUDA_MAX_FORWARD_TOKENS": "6", "MAX_LENGTH": "6"}),
+            patch("provider.app._GpuEmbedderWorker", side_effect=fake_worker_factory),
+            patch("provider.app._detect_preferred_device", return_value="cuda"),
+            patch("provider.app._probe_cuda_memory_bytes", return_value=(8 * 1024**3, 24 * 1024**3)),
+        ):
+            runtime = EmbedderRuntime(Settings.from_env())
+            runtime.adaptive_batch._current_target = 8
+            # "Document: " prefix + words: 5, 2, 2, 2 tokens.  5 pads a pair to 10 > 6, so it goes
+            # alone; three 2-token texts pad to 6.
+            embeddings = runtime.encode(["a b c d", "e", "f", "g"])
+            runtime.close()
+
+        self.assertEqual(len(embeddings), 4)
+        self.assertEqual(workers[0].batch_sizes, [1, 3])
+
+    def test_cuda_forward_token_budget_must_cover_one_text_at_max_length(self) -> None:
+        with patch.dict(os.environ, {"CUDA_MAX_FORWARD_TOKENS": "100", "MAX_LENGTH": "256"}):
+            with self.assertRaisesRegex(ValueError, "CUDA_MAX_FORWARD_TOKENS"):
+                Settings.from_env()
+
     def test_prompt_name_reaches_gpu_worker_and_cpu_model_only_when_requested(self) -> None:
         worker_holder: list[FakeWorker] = []
 

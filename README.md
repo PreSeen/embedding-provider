@@ -110,17 +110,17 @@ curl http://127.0.0.1:8000/statsz
 ## Current Production Endpoint
 
 - Public base URL: `https://embed.preseen.ai/v1`
-- Current model: `jinaai/jina-embeddings-v5-text-nano`
-- Current service bind on `gpu4`: `127.0.0.1:7997`
-- Provider defaults:
+- Current model: `jinaai/jina-embeddings-v5-text-small` (`deployments/gpu4/jina-v5-small.env`, not in git)
+- Current service bind on `gpu4`: `0.0.0.0:7997`
+- Provider settings:
   - `MAX_LENGTH=8192`
   - `MAX_BATCH_SIZE=64`
   - `CPU_BATCH_TARGET=8`
   - `START_DEVICE=cpu`
-  - `DEFAULT_DIMENSIONS=768`
-  - `IDLE_OFFLOAD_SECONDS=1800`
+  - `DEFAULT_DIMENSIONS=1024`
   - `REQUEST_LOG_LIMIT=100000`
   - `EMBEDDING_CACHE_LIMIT=100000`
+  - `INTERACTIVE_MAX_TOKENS=1024` and `CUDA_MAX_FORWARD_TOKENS=8192`, with `CUDA_VISIBLE_DEVICES=1`, the card llm-gateway keeps a reserve on (see the two sections below)
 
 ## Idle GPU Offload
 
@@ -154,9 +154,23 @@ When idle offload is enabled:
 
 This only affects the embedding-provider process itself. It does not touch the OCR service, system CUDA, or other GPU workloads on the host.
 
+## Interactive Queue
+
+`INTERACTIVE_MAX_TOKENS` (default `0`, off) splits requests into two queues by size. A request whose uncached inputs total at most that many tokens (prompt prefix included, after `MAX_LENGTH` truncation) goes to the interactive queue; everything else goes to the bulk queue. The rule needs nothing from the caller.
+
+The interactive queue has its own CPU model instance and its own batcher, so its forwards run beside the bulk queue's instead of after them. Without it, every request waited for the bulk forward in progress: on gpu4 a CPU forward of 8 long documents took 59–116 s, and a 1-text recall query spent about 125 s queued for a 4.4 s forward (2026-11-17). The second instance is required, not an optimisation: Jina v5 `encode()` calls `set_adapter([task])` on the model, so two concurrent forwards on one instance with different tasks would race on the active adapter. It costs one more copy of the weights in RAM (about 1.4 GB for `jina-v5-small`).
+
+Each interactive forward is also capped at `INTERACTIVE_MAX_TOKENS` padded tokens (texts × the longest text), so a burst of short requests cannot build a long forward. The interactive queue always runs on CPU; GPU scale-up and scale-down follow the bulk queue only. `/statsz` and `/healthz` report it under `interactive_queue`, and `/request-logz` records each request's `queue` (`interactive`, `bulk` or `cache`).
+
+On gpu4 the setting is `1024`. It covers 99% of memory.preseen.ai's 1-text requests (p90 514 tokens, p99 940) and 96% of its multi-text ones, while CoSens and email-classifier documents (2,400–8,192 tokens per text) stay in the bulk queue. A 1024-token forward takes about 1 s on CPU alone and 1.6 s beside a bulk forward on 8 cores. Measurements: `docs/benchmarks/2026-11-17-interactive-queue-and-cuda-peak.md`.
+
+## CUDA Forward Token Budget
+
+`CUDA_MAX_FORWARD_TOKENS` (default `0`, off) caps each GPU forward at that many padded tokens. It must be at least `MAX_LENGTH`, so one text at the limit always fits. The worker's VRAM peak grows about 1.3 GiB per 8192 tokens in a forward, so the cap is what bounds the worker's footprint. llm-gateway's `GPU_NEIGHBOUR_RESERVE_MIB` is sized from that footprint; the two must be changed together. Measured on an RTX 5090 at `MAX_LENGTH=8192` (process footprint as `nvidia-smi` reports it): 1.92 GiB loaded, 3.36 GiB at 8,192 tokens, 4.73 at 16,384, 7.86 at 32,768, 14.1 at 65,536. A cap of 8192 loses almost no throughput: a forward costs about 0.2 s per 8192-token text from batch 2 upward.
+
 ## GPU Forward Concurrency
 
-CPU inference always stays serial because parallel CPU forwards compete for the same cores without improving useful throughput. CUDA can use bounded concurrent forwards when `GPU_FORWARD_CONCURRENCY` is greater than `1`: the central batcher splits only the current adaptive text budget across lanes, the parent correlates out-of-order worker responses by request ID, and the child retains one model copy. `/statsz` reports `gpu_forward_concurrency_configured`, `gpu_forward_concurrency_effective`, `gpu_forwards_in_flight`, and `gpu_forward_peak_in_flight`.
+The bulk queue's CPU inference always stays serial because parallel CPU forwards compete for the same cores without improving useful throughput (the interactive queue above is a separate, short forward). CUDA can use bounded concurrent forwards when `GPU_FORWARD_CONCURRENCY` is greater than `1`: the central batcher splits only the current adaptive text budget across lanes, the parent correlates out-of-order worker responses by request ID, and the child retains one model copy. `/statsz` reports `gpu_forward_concurrency_configured`, `gpu_forward_concurrency_effective`, `gpu_forwards_in_flight`, and `gpu_forward_peak_in_flight`.
 
 Keep the generic default at `1`. Benchmark `jina-v5-small` candidates in an isolated local instance before changing its production env:
 
