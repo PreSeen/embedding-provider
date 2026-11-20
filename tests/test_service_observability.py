@@ -3,6 +3,8 @@ from __future__ import annotations
 import sys
 import types
 import os
+
+import numpy as np
 import asyncio
 import json
 import threading
@@ -632,6 +634,19 @@ def test_embedding_result_cache_eviction_and_snapshot() -> None:
     assert snapshot["max_entries"] == 2
     assert snapshot["hits"] == 2
     assert snapshot["misses"] == 1
+
+
+def test_embedding_result_cache_stores_float32_arrays_and_returns_the_same_values() -> None:
+    # A tuple of 1024 Python floats takes 32.7 KiB; a float32 array 4.3 KiB.  The provider's embeddings
+    # are float32 (computed in bf16, normalised in float32), so storing float32 loses nothing.
+    cache = EmbeddingResultCache(max_entries=4)
+    key = ("model", 1024, "retrieval", "query", "alpha")
+    embedding = (np.arange(1, 1025, dtype=np.float32) / np.float32(3.0)).tolist()
+    cache.set_many([(key, embedding)])
+
+    stored = cache._items[key]
+    assert isinstance(stored, np.ndarray) and stored.dtype == np.float32
+    assert cache.get_many([key]) == [embedding]
 
 
 def test_country_for_ip_identifies_local_networks() -> None:

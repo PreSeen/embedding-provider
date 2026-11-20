@@ -298,6 +298,42 @@ class EmbedderRuntimeIdleOffloadTests(unittest.TestCase):
         self.assertEqual(len(embeddings), 4)
         self.assertEqual(workers[0].batch_sizes, [1, 3])
 
+    def test_cpu_forwards_stay_within_the_padded_token_budget(self) -> None:
+        # CPU activations grow about 1.25 GB per 8192-token text; one bulk forward of 8 such texts
+        # peaked the process at 15 GB RSS on gpu4 (2026-11-18..20) and pushed the box into swap.
+        recorded: list[int] = []
+
+        class RecordingModel:
+            def to(self, device):
+                return self
+
+            def eval(self):
+                return self
+
+            def encode(self, texts: list[str], **kwargs) -> np.ndarray:
+                recorded.append(len(texts))
+                return np.ones((len(texts), kwargs.get("truncate_dim") or 4), dtype=np.float32)
+
+        transformers = sys.modules["transformers"]
+        with (
+            patch.dict(os.environ, {"CPU_MAX_FORWARD_TOKENS": "6", "MAX_LENGTH": "6", "START_DEVICE": "cpu"}),
+            patch("provider.app._detect_preferred_device", return_value="cpu"),
+            patch.object(transformers.AutoModel, "from_pretrained", return_value=RecordingModel()),
+        ):
+            runtime = EmbedderRuntime(Settings.from_env())
+            # "Document: " prefix + words: 5, 2, 2, 2 tokens.  5 pads a pair to 10 > 6, so it goes
+            # alone; three 2-token texts pad to 6.
+            embeddings = runtime.encode(["a b c d", "e", "f", "g"])
+            runtime.close()
+
+        self.assertEqual(len(embeddings), 4)
+        self.assertEqual(recorded, [1, 3])
+
+    def test_cpu_forward_token_budget_must_cover_one_text_at_max_length(self) -> None:
+        with patch.dict(os.environ, {"CPU_MAX_FORWARD_TOKENS": "100", "MAX_LENGTH": "256"}):
+            with self.assertRaisesRegex(ValueError, "CPU_MAX_FORWARD_TOKENS"):
+                Settings.from_env()
+
     def test_cuda_forward_token_budget_must_cover_one_text_at_max_length(self) -> None:
         with patch.dict(os.environ, {"CUDA_MAX_FORWARD_TOKENS": "100", "MAX_LENGTH": "256"}):
             with self.assertRaisesRegex(ValueError, "CUDA_MAX_FORWARD_TOKENS"):

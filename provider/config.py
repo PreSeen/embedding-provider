@@ -63,6 +63,7 @@ class Settings:
     cuda_retry_seconds: float = 300.0
     interactive_max_tokens: int = 0
     cuda_max_forward_tokens: int = 0
+    cpu_max_forward_tokens: int = 0
     peer_base_url: str | None = None
     peer_api_key: str | None = None
     peer_timeout_seconds: float = 60.0
@@ -71,11 +72,12 @@ class Settings:
     def __post_init__(self) -> None:
         if self.overflow_busy_seconds > 0 and not self.peer_base_url:
             raise ValueError("OVERFLOW_BUSY_SECONDS needs PEER_BASE_URL")
-        if self.cuda_max_forward_tokens and self.max_length and self.cuda_max_forward_tokens < self.max_length:
-            raise ValueError(
-                f"CUDA_MAX_FORWARD_TOKENS={self.cuda_max_forward_tokens} must cover one text at "
-                f"MAX_LENGTH={self.max_length}"
-            )
+        for name, budget in (
+            ("CUDA_MAX_FORWARD_TOKENS", self.cuda_max_forward_tokens),
+            ("CPU_MAX_FORWARD_TOKENS", self.cpu_max_forward_tokens),
+        ):
+            if budget and self.max_length and budget < self.max_length:
+                raise ValueError(f"{name}={budget} must cover one text at MAX_LENGTH={self.max_length}")
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -112,6 +114,7 @@ class Settings:
             cuda_retry_seconds=_env_float("CUDA_RETRY_SECONDS", "300"),
             interactive_max_tokens=_env_int("INTERACTIVE_MAX_TOKENS", "0") or 0,
             cuda_max_forward_tokens=_env_int("CUDA_MAX_FORWARD_TOKENS", "0") or 0,
+            cpu_max_forward_tokens=_env_int("CPU_MAX_FORWARD_TOKENS", "0") or 0,
             peer_base_url=(os.getenv("PEER_BASE_URL") or "").rstrip("/") or None,
             peer_api_key=os.getenv("PEER_API_KEY") or None,
             peer_timeout_seconds=_env_float("PEER_TIMEOUT_SECONDS", "60"),
