@@ -431,7 +431,9 @@ EmbeddingCacheKey = tuple[str, int | None, str | None, str | None, str]
 class EmbeddingResultCache:
     def __init__(self, *, max_entries: int) -> None:
         self._max_entries = max(0, int(max_entries))
-        self._items: OrderedDict[EmbeddingCacheKey, tuple[float, ...]] = OrderedDict()
+        # float32 arrays: the embeddings are float32 already (computed in bf16, normalised in float32),
+        # and a tuple of 1024 Python floats takes 32.7 KiB against 4.3 KiB for the array.
+        self._items: OrderedDict[EmbeddingCacheKey, np.ndarray] = OrderedDict()
         self._lock = threading.Lock()
         self._hits = 0
         self._misses = 0
@@ -451,7 +453,7 @@ class EmbeddingResultCache:
                     continue
                 self._hits += 1
                 self._items.move_to_end(key)
-                results.append(list(cached))
+                results.append(cached.tolist())
         return results
 
     def set_many(self, items: list[tuple[EmbeddingCacheKey, list[float]]]) -> None:
@@ -459,7 +461,9 @@ class EmbeddingResultCache:
             return
         with self._lock:
             for key, embedding in items:
-                self._items[key] = tuple(float(value) for value in embedding)
+                stored = np.asarray(embedding, dtype=np.float32)
+                stored.flags.writeable = False
+                self._items[key] = stored
                 self._items.move_to_end(key)
             while len(self._items) > self._max_entries:
                 self._items.popitem(last=False)
@@ -1755,12 +1759,17 @@ class EmbedderRuntime:
         succeeded = False
         try:
             embeddings: list[list[float]] = []
-            # Bounds the worker's VRAM peak, which is what GPU_NEIGHBOUR_RESERVE_MIB in llm-gateway
-            # is sized from (activations grow about 1.3 GiB per 8192 tokens).
+            # Bounds the forward's activation peak: on CUDA the worker's VRAM, which is what
+            # GPU_NEIGHBOUR_RESERVE_MIB in llm-gateway is sized from (about 1.3 GiB per 8192 tokens);
+            # on CPU the process RSS (about 1.25 GB per 8192 tokens; 8 such texts in one forward took
+            # it to 15 GB).  CPU time grows with tokens, not forwards, so splitting costs no throughput.
+            forward_token_budget = (
+                self._settings.cuda_max_forward_tokens
+                if self._preferred_device == "cuda"
+                else self._settings.cpu_max_forward_tokens
+            )
             token_counts = (
-                self._input_length_validator.token_counts(texts, prompt_name)
-                if self._preferred_device == "cuda" and self._settings.cuda_max_forward_tokens
-                else None
+                self._input_length_validator.token_counts(texts, prompt_name) if forward_token_budget else None
             )
             offset = 0
             while offset < len(texts):
@@ -1775,7 +1784,7 @@ class EmbedderRuntime:
                 chunk_size = max(1, min(chunk_target, remaining))
                 if token_counts is not None:
                     chunk_size = _padded_token_prefix_length(
-                        token_counts[offset: offset + chunk_size], self._settings.cuda_max_forward_tokens
+                        token_counts[offset: offset + chunk_size], forward_token_budget
                     )
                 chunk = texts[offset: offset + chunk_size]
                 result = self._encode_with_backoff(chunk, dimensions=dimensions, task=task, prompt_name=prompt_name)

@@ -120,7 +120,7 @@ curl http://127.0.0.1:8000/statsz
   - `DEFAULT_DIMENSIONS=1024`
   - `REQUEST_LOG_LIMIT=100000`
   - `EMBEDDING_CACHE_LIMIT=100000`
-  - `INTERACTIVE_MAX_TOKENS=1024` and `CUDA_MAX_FORWARD_TOKENS=8192`, with `CUDA_VISIBLE_DEVICES=1`, the card llm-gateway keeps a reserve on (see the two sections below)
+  - `INTERACTIVE_MAX_TOKENS=1024`, `CPU_MAX_FORWARD_TOKENS=8192` and `CUDA_MAX_FORWARD_TOKENS=8192`, with `CUDA_VISIBLE_DEVICES=1`, the card llm-gateway keeps a reserve on (see the two sections below)
 
 ## Idle GPU Offload
 
@@ -137,7 +137,7 @@ On CUDA hosts, the provider now keeps the HTTP process alive but moves the loade
 - `CUDA_VISIBLE_DEVICES`: the cards the GPU worker may use. With several cards (for example `0,1`) each GPU worker start probes their free VRAM with `nvidia-smi` and runs on the one with the most free memory (the first listed card on ties or failed probes); the worker process sees only that card, and the VRAM batch cap follows it. With one card nothing is probed. Use this when the LLM gateway moves its models between the cards. `/statsz` shows the card as `cuda_device_index`.
 - `CUDA_RETRY_SECONDS` (default `300`): after the GPU worker fails to start (for example CUDA OOM because another service holds the VRAM) the runtime serves from CPU; after this many seconds the next batch of `CPU_TO_GPU_SCALE_UP_TEXTS` or more texts retries CUDA. A successful start ends the fallback and re-enables idle offload; a failed retry starts the wait again. `POST /admin/device` with `cuda` retries immediately. `/statsz` shows `cuda_fallback_reason` and `cuda_retry_in_seconds`.
 - `REQUEST_LOG_LIMIT`: in-memory request/input log retention limit
-- `EMBEDDING_CACHE_LIMIT`: in-memory exact-match embedding cache entry limit
+- `EMBEDDING_CACHE_LIMIT`: in-memory exact-match embedding cache entry limit. Each entry holds a float32 array (4.3 KiB at 1,024 dimensions, so about 0.42 GB at 100,000 entries); the embeddings are float32 already, so a hit returns the same values a miss would
 - `CUDA_BATCH_GROWTH_FACTOR`: multiplier used when CUDA target grows after full successful dispatches
 - `CUDA_BATCH_DEMAND_EMA_ALPHA`: smoothing factor for lowering CUDA target toward recent average queue demand
 - `CUDA_VRAM_SAFETY_FIXED_MB`: fixed CUDA free-VRAM safety headroom
@@ -182,6 +182,8 @@ On gpu4: `PEER_BASE_URL=http://27.221.10.54:41006/retrieval/v1` (the A100 the CN
 ## CUDA Forward Token Budget
 
 `CUDA_MAX_FORWARD_TOKENS` (default `0`, off) caps each GPU forward at that many padded tokens. It must be at least `MAX_LENGTH`, so one text at the limit always fits. The worker's VRAM peak grows about 1.3 GiB per 8192 tokens in a forward, so the cap is what bounds the worker's footprint. llm-gateway's `GPU_NEIGHBOUR_RESERVE_MIB` is sized from that footprint; the two must be changed together. Measured on an RTX 5090 at `MAX_LENGTH=8192` (process footprint as `nvidia-smi` reports it): 1.92 GiB loaded, 3.36 GiB at 8,192 tokens, 4.73 at 16,384, 7.86 at 32,768, 14.1 at 65,536. A cap of 8192 loses almost no throughput: a forward costs about 0.2 s per 8192-token text from batch 2 upward.
+
+`CPU_MAX_FORWARD_TOKENS` (default `0`, off) does the same for CPU forwards, and must also be at least `MAX_LENGTH`. On CPU the process RSS grows about 1.25 GB per 8192-token text in a forward (measured 2026-11-20 on gpu4: 1.96 GB loaded, 4.68 GB with one 8192-token text, 5.92 GB with two). Without the cap one bulk forward of 8 such texts took the process to 15 GB and pushed the box into swap. CPU time grows with the tokens, not with the number of forwards (one 8192-token text 21 s, two 42 s), so the cap costs no throughput.
 
 ## GPU Forward Concurrency
 
