@@ -66,7 +66,7 @@ class Settings:
     cpu_max_forward_tokens: int = 0
     peer_base_url: str | None = None
     peer_api_key: str | None = None
-    peer_timeout_seconds: float = 60.0
+    peer_timeout_seconds: float = 10.0
     overflow_busy_seconds: float = 0.0
 
     def __post_init__(self) -> None:
@@ -117,6 +117,6 @@ class Settings:
             cpu_max_forward_tokens=_env_int("CPU_MAX_FORWARD_TOKENS", "0") or 0,
             peer_base_url=(os.getenv("PEER_BASE_URL") or "").rstrip("/") or None,
             peer_api_key=os.getenv("PEER_API_KEY") or None,
-            peer_timeout_seconds=_env_float("PEER_TIMEOUT_SECONDS", "60"),
+            peer_timeout_seconds=_env_float("PEER_TIMEOUT_SECONDS", "10"),
             overflow_busy_seconds=_env_float("OVERFLOW_BUSY_SECONDS", "0"),
         )
