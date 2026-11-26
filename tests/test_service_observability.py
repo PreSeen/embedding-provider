@@ -1112,6 +1112,8 @@ def test_settings_reads_overflow_and_requires_a_peer_when_enabled() -> None:
         settings = Settings.from_env()
     assert settings.peer_base_url is None
     assert settings.overflow_busy_seconds == 0.0
+    # Callers give up after 60 s (Memory writes), so the peer wait must end well before that.
+    assert settings.peer_timeout_seconds == 10.0
     with patch.dict(os.environ, {"OVERFLOW_BUSY_SECONDS": "10"}, clear=True):
         with pytest.raises(ValueError, match="PEER_BASE_URL"):
             Settings.from_env()

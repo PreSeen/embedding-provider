@@ -171,7 +171,7 @@ On gpu4 the setting is `1024`. It covers 99% of memory.preseen.ai's 1-text reque
 - A request is forwarded when the queue it would use (interactive or bulk) has had an unfinished text for at least `OVERFLOW_BUSY_SECONDS`. The age counts the forward in progress, so one 100 s CPU forward trips it after the threshold, and a GPU forward of about a second never does. A request whose texts are all cached is served locally; one with any uncached text is forwarded whole.
 - The forward is `POST {PEER_BASE_URL}/embeddings` with `x-gateway-overflow: 1` and, if `PEER_API_KEY` is set, a bearer token. `task` and `dimensions` are sent already resolved from this host's defaults, because the peer's route has its own default task. `prompt_name` is passed through, and `model` is left out so the peer uses the model it has loaded.
 - A request that carries `x-gateway-overflow` is always served locally, so two hosts that list each other cannot bounce a request.
-- If the peer is unreachable, answers non-200, times out (`PEER_TIMEOUT_SECONDS`, default `60`) or returns the wrong number of vectors, the request is served locally and `peer_failures_total` is counted.
+- If the peer is unreachable, answers non-200, times out (`PEER_TIMEOUT_SECONDS`, default `10`; a stuck peer must not hold a request past the callers' own timeouts, which are 60 s for Memory writes) or returns the wrong number of vectors, the request is served locally and `peer_failures_total` is counted.
 - `OVERFLOW_BUSY_SECONDS` without `PEER_BASE_URL` fails at startup.
 - `/statsz` shows `overflow` (`forwarded_total`, `peer_failures_total`); `/request-logz` records forwarded requests with `queue` = `peer`.
 
